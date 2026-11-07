@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+perf-opt: Zero-dependency Performance, Memory, and Latency Profiling CLI.
+
+Designed for high-performance profiling of CLI tools, native engines (Rust/Bun/Node),
+memory leak detection, event-loop latency, and command benchmarking.
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def get_process_stats(pid: int) -> Optional[Dict[str, Any]]:
+    """Retrieve process statistics from /proc/[pid]/ on Linux, with fallback to ps."""
+    # Check if process exists
+    if not os.path.exists(f"/proc/{pid}"):
+        return None
+
+    rss_kb = 0
+    vms_kb = 0
+    peak_rss_kb = 0
+    utime = 0
+    stime = 0
+
+    try:
+        # Read status for memory
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        rss_kb = int(parts[1])
+                elif line.startswith("VmSize:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        vms_kb = int(parts[1])
+                elif line.startswith("VmHWM:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        peak_rss_kb = int(parts[1])
+
+        # Read stat for CPU ticks
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+            stat_content = f.read().strip()
+            # The executable name is in parens: (exe_name)
+            rparen_idx = stat_content.rfind(")")
+            if rparen_idx != -1:
+                fields = stat_content[rparen_idx + 2 :].split()
+                # field 11 is utime (14th in 1-based indexing), field 12 is stime (15th)
+                if len(fields) >= 13:
+                    utime = int(fields[11])
+                    stime = int(fields[12])
+
+        return {
+            "pid": pid,
+            "rss_kb": rss_kb,
+            "rss_mb": round(rss_kb / 1024.0, 2),
+            "vms_kb": vms_kb,
+            "vms_mb": round(vms_kb / 1024.0, 2),
+            "peak_rss_mb": round(peak_rss_kb / 1024.0, 2) if peak_rss_kb else round(rss_kb / 1024.0, 2),
+            "utime": utime,
+            "stime": stime,
+            "total_time": utime + stime,
+        }
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+
+
+def run_profile(args: argparse.Namespace) -> int:
+    """Execute memory and CPU profiling against a running PID or spawned command."""
+    pid = args.pid
+    proc = None
+    cmd = args.cmd
+
+    if not pid and not cmd:
+        sys.stderr.write("Error: Either --pid or --cmd must be provided to profile.\n")
+        return 1
+
+    if cmd:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.DEVNULL if not args.verbose else None,
+                stderr=subprocess.DEVNULL if not args.verbose else None,
+            )
+            pid = proc.pid
+        except Exception as e:
+            sys.stderr.write(f"Error launching command '{cmd}': {e}\n")
+            return 1
+
+    interval = max(0.01, float(args.interval))
+    duration = float(args.duration) if args.duration else None
+
+    samples: List[Dict[str, Any]] = []
+    start_wall = time.time()
+    last_sample_time = start_wall
+    last_cpu_time = 0.0
+
+    clk_tck = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK")) if hasattr(os, "sysconf") else 100
+
+    # Collect initial sample
+    initial_stats = get_process_stats(pid)
+    if not initial_stats:
+        sys.stderr.write(f"Error: Process with PID {pid} not found or inaccessible.\n")
+        if proc:
+            proc.kill()
+        return 1
+
+    last_cpu_time = initial_stats["total_time"]
+
+    try:
+        while True:
+            time.sleep(interval)
+            now = time.time()
+            elapsed_total = now - start_wall
+
+            if duration and elapsed_total >= duration:
+                break
+
+            stats = get_process_stats(pid)
+            if not stats:
+                # Process ended
+                break
+
+            dt = now - last_sample_time
+            if dt > 0:
+                dcpu = stats["total_time"] - last_cpu_time
+                cpu_percent = (dcpu / clk_tck / dt) * 100.0
+            else:
+                cpu_percent = 0.0
+
+            sample = {
+                "elapsed_s": round(elapsed_total, 3),
+                "rss_mb": stats["rss_mb"],
+                "vms_mb": stats["vms_mb"],
+                "cpu_percent": round(max(0.0, cpu_percent), 1),
+            }
+            samples.append(sample)
+
+            last_sample_time = now
+            last_cpu_time = stats["total_time"]
+
+            # If spawned process exited, break
+            if proc and proc.poll() is not None:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                proc.kill()
+
+    total_samples = len(samples)
+    if total_samples == 0:
+        samples.append({
+            "elapsed_s": 0.0,
+            "rss_mb": initial_stats["rss_mb"],
+            "vms_mb": initial_stats["vms_mb"],
+            "cpu_percent": 0.0,
+        })
+
+    rss_values = [s["rss_mb"] for s in samples]
+    cpu_values = [s["cpu_percent"] for s in samples]
+
+    peak_rss = max(rss_values)
+    min_rss = min(rss_values)
+    avg_rss = round(sum(rss_values) / len(rss_values), 2)
+    avg_cpu = round(sum(cpu_values) / len(cpu_values), 1)
+    peak_cpu = max(cpu_values)
+
+    # Detect memory leak trend (linear regression slope)
+    leak_detected = False
+    growth_mb_per_min = 0.0
+    if len(samples) >= 5:
+        n = len(samples)
+        x = [s["elapsed_s"] for s in samples]
+        y = rss_values
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xx = sum(xi * xi for xi in x)
+        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+        denom = n * sum_xx - sum_x * sum_x
+        if denom != 0:
+            slope = (n * sum_xy - sum_x * sum_y) / denom  # MB per second
+            growth_mb_per_min = round(slope * 60.0, 2)
+            # If growing by > 5MB/min and end memory is > 20% higher than start
+            if growth_mb_per_min > 5.0 and (rss_values[-1] - rss_values[0]) > 2.0:
+                leak_detected = True
+
+    result = {
+        "pid": pid,
+        "command": cmd or f"PID {pid}",
+        "duration_s": round(time.time() - start_wall, 2),
+        "samples_count": len(samples),
+        "peak_rss_mb": peak_rss,
+        "min_rss_mb": min_rss,
+        "avg_rss_mb": avg_rss,
+        "avg_cpu_percent": avg_cpu,
+        "peak_cpu_percent": peak_cpu,
+        "growth_mb_per_min": growth_mb_per_min,
+        "leak_detected": leak_detected,
+        "samples": samples if args.all_samples else samples[:: max(1, len(samples) // 20)],
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Performance Profile: {result['command']} (PID {pid}) ===")
+        print(f"Duration:         {result['duration_s']}s ({result['samples_count']} samples @ {interval}s)")
+        print(f"Peak RSS Memory:  {peak_rss} MB")
+        print(f"Avg RSS Memory:   {avg_rss} MB (Min: {min_rss} MB)")
+        print(f"Avg CPU Usage:    {avg_cpu}% (Peak: {peak_cpu}%)")
+        print(f"Memory Trend:     {growth_mb_per_min:+.2f} MB/min")
+        if leak_detected:
+            print("Status:           [WARNING] Potential memory leak detected (monotonic growth)!")
+        else:
+            print("Status:           [OK] Memory usage stable.")
+
+    return 0
+
+
+def run_bench(args: argparse.Namespace) -> int:
+    """Benchmark command execution over N iterations."""
+    cmd = args.cmd
+    iterations = max(1, int(args.iterations))
+    warmup = max(0, int(args.warmup))
+
+    if not cmd:
+        sys.stderr.write("Error: Command to benchmark (--cmd) is required.\n")
+        return 1
+
+    # Warmup runs
+    for _ in range(warmup):
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0 and not args.allow_failure:
+            sys.stderr.write(f"Warmup failed with return code {res.returncode}.\n")
+            return 1
+
+    times_ms: List[float] = []
+    exit_codes: List[int] = []
+
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        dt = (time.perf_counter() - t0) * 1000.0
+        times_ms.append(dt)
+        exit_codes.append(res.returncode)
+
+    times_ms.sort()
+    n = len(times_ms)
+    mean_ms = sum(times_ms) / n
+    median_ms = times_ms[n // 2] if n % 2 != 0 else (times_ms[n // 2 - 1] + times_ms[n // 2]) / 2.0
+    min_ms = times_ms[0]
+    max_ms = times_ms[-1]
+    variance = sum((t - mean_ms) ** 2 for t in times_ms) / n
+    stddev_ms = math.sqrt(variance)
+    ops_per_sec = round(1000.0 / mean_ms, 2) if mean_ms > 0 else 0.0
+
+    p90_ms = times_ms[min(int(n * 0.90), n - 1)]
+    p99_ms = times_ms[min(int(n * 0.99), n - 1)]
+
+    result = {
+        "command": cmd,
+        "iterations": iterations,
+        "warmup": warmup,
+        "mean_ms": round(mean_ms, 3),
+        "median_ms": round(median_ms, 3),
+        "min_ms": round(min_ms, 3),
+        "max_ms": round(max_ms, 3),
+        "stddev_ms": round(stddev_ms, 3),
+        "p90_ms": round(p90_ms, 3),
+        "p99_ms": round(p99_ms, 3),
+        "ops_per_sec": ops_per_sec,
+        "exit_codes": dict(set((c, exit_codes.count(c)) for c in exit_codes)),
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Benchmark Results: {cmd} ===")
+        print(f"Iterations:   {iterations} (Warmup: {warmup})")
+        print(f"Throughput:   {ops_per_sec} ops/sec")
+        print(f"Mean:         {result['mean_ms']:.2f} ms ± {result['stddev_ms']:.2f} ms")
+        print(f"Median:       {result['median_ms']:.2f} ms")
+        print(f"Min ... Max:  {result['min_ms']:.2f} ms ... {result['max_ms']:.2f} ms")
+        print(f"P90 / P99:    {result['p90_ms']:.2f} ms / {result['p99_ms']:.2f} ms")
+
+    return 0
+
+
+def run_eventloop(args: argparse.Namespace) -> int:
+    """Measure event loop latency / scheduling jitter."""
+    duration = max(0.5, float(args.duration))
+    target_interval_ms = max(1.0, float(args.interval_ms))
+    target_interval_s = target_interval_ms / 1000.0
+
+    delays_ms: List[float] = []
+    start_time = time.perf_counter()
+
+    expected_next = start_time + target_interval_s
+
+    while True:
+        now = time.perf_counter()
+        if (now - start_time) >= duration:
+            break
+
+        sleep_time = expected_next - now
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+        actual_time = time.perf_counter()
+        lag_ms = max(0.0, (actual_time - expected_next) * 1000.0)
+        delays_ms.append(lag_ms)
+
+        expected_next = actual_time + target_interval_s
+
+    if not delays_ms:
+        delays_ms = [0.0]
+
+    delays_ms.sort()
+    n = len(delays_ms)
+    mean_lag = sum(delays_ms) / n
+    median_lag = delays_ms[n // 2]
+    max_lag = delays_ms[-1]
+    p95_lag = delays_ms[min(int(n * 0.95), n - 1)]
+    p99_lag = delays_ms[min(int(n * 0.99), n - 1)]
+
+    # Lag spikes: delays exceeding 3x the target interval or > 20ms
+    spike_threshold = max(20.0, target_interval_ms * 3.0)
+    spikes = [d for d in delays_ms if d >= spike_threshold]
+
+    result = {
+        "duration_s": round(duration, 2),
+        "target_interval_ms": target_interval_ms,
+        "samples": n,
+        "mean_lag_ms": round(mean_lag, 3),
+        "median_lag_ms": round(median_lag, 3),
+        "max_lag_ms": round(max_lag, 3),
+        "p95_lag_ms": round(p95_lag, 3),
+        "p99_lag_ms": round(p99_lag, 3),
+        "spike_count": len(spikes),
+        "responsive": len(spikes) == 0 and mean_lag < 5.0,
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Event Loop Responsiveness ({duration}s test) ===")
+        print(f"Target Interval:   {target_interval_ms:.1f} ms ({n} ticks)")
+        print(f"Median Lag:        {result['median_lag_ms']:.2f} ms")
+        print(f"Mean Lag:          {result['mean_lag_ms']:.2f} ms (P95: {result['p95_lag_ms']:.2f} ms, P99: {result['p99_lag_ms']:.2f} ms)")
+        print(f"Max Lag Spike:     {result['max_lag_ms']:.2f} ms")
+        print(f"Lag Spikes (>={spike_threshold:.1f}ms): {result['spike_count']}")
+        if result["responsive"]:
+            print("Status:            [HEALTHY] Event loop is responsive with minimal jitter.")
+        else:
+            print("Status:            [DEGRADED] Event loop experienced blocking spikes!")
+
+    return 0
+
+
+def run_heap(args: argparse.Namespace) -> int:
+    """Analyze a JSON heap profile or object dump."""
+    filepath = args.file
+    if not filepath or not os.path.exists(filepath):
+        sys.stderr.write(f"Error: Heap snapshot file '{filepath}' does not exist.\n")
+        return 1
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        sys.stderr.write(f"Error parsing heap JSON file '{filepath}': {e}\n")
+        return 1
+
+    # Support multiple formats:
+    # 1. Custom list of objects: [{"name": "Foo", "size": 1234}, ...]
+    # 2. Key-value dictionary of type counts or sizes
+    # 3. Standard V8 snapshot structure
+    breakdown: List[Dict[str, Any]] = []
+    total_bytes = 0
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("constructor") or item.get("type") or "Unknown"
+                size = item.get("size") or item.get("bytes") or item.get("retained_size") or 0
+                count = item.get("count") or 1
+                breakdown.append({"name": str(name), "size_bytes": int(size), "count": int(count)})
+                total_bytes += int(size)
+    elif isinstance(data, dict):
+        if "snapshot" in data and "nodes" in data:
+            # V8 snapshot metadata
+            node_count = len(data.get("nodes", []))
+            edge_count = len(data.get("edges", []))
+            breakdown.append({"name": "V8_Nodes", "size_bytes": node_count * 32, "count": node_count})
+            breakdown.append({"name": "V8_Edges", "size_bytes": edge_count * 16, "count": edge_count})
+            total_bytes = sum(b["size_bytes"] for b in breakdown)
+        else:
+            for k, v in data.items():
+                if isinstance(v, (int, float)):
+                    breakdown.append({"name": k, "size_bytes": int(v), "count": 1})
+                    total_bytes += int(v)
+                elif isinstance(v, dict):
+                    size = v.get("size") or v.get("bytes") or 0
+                    count = v.get("count") or 1
+                    breakdown.append({"name": k, "size_bytes": int(size), "count": int(count)})
+                    total_bytes += int(size)
+
+    # Sort descending by size
+    breakdown.sort(key=lambda x: x["size_bytes"], reverse=True)
+
+    top_items = breakdown[: args.limit]
+    result = {
+        "file": filepath,
+        "total_size_mb": round(total_bytes / (1024 * 1024), 2),
+        "total_size_bytes": total_bytes,
+        "types_count": len(breakdown),
+        "top_allocations": top_items,
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Heap Snapshot Analysis: {filepath} ===")
+        print(f"Total Heap Size:   {result['total_size_mb']} MB ({total_bytes:,} bytes)")
+        print(f"Distinct Types:    {len(breakdown)}")
+        print("\nTop Retained Allocations:")
+        print(f"{'Type/Constructor':<35} {'Count':>10} {'Size (KB)':>12} {'% Heap':>8}")
+        print("-" * 68)
+        for item in top_items:
+            pct = (item["size_bytes"] / total_bytes * 100.0) if total_bytes > 0 else 0.0
+            size_kb = item["size_bytes"] / 1024.0
+            print(f"{item['name'][:34]:<35} {item['count']:>10,} {size_kb:>11.1f} {pct:>7.1f}%")
+
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="perf-opt",
+        description="Zero-dependency performance, memory, and latency profiling engine.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+
+    # profile
+    p_profile = subparsers.add_parser("profile", help="Profile CPU, RSS memory, and leak trends")
+    p_profile.add_argument("--pid", type=int, help="Target process ID to profile")
+    p_profile.add_argument("--cmd", type=str, help="Command to spawn and profile")
+    p_profile.add_argument("--interval", type=float, default=0.1, help="Sampling interval in seconds (default: 0.1)")
+    p_profile.add_argument("--duration", type=float, help="Maximum profile duration in seconds")
+    p_profile.add_argument("--all-samples", action="store_true", help="Include all raw samples in JSON output")
+    p_profile.add_argument("--verbose", action="store_true", help="Show spawned process stdout/stderr")
+    p_profile.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # bench
+    p_bench = subparsers.add_parser("bench", help="Benchmark execution time and throughput")
+    p_bench.add_argument("cmd", nargs="?", type=str, help="Command string to benchmark")
+    p_bench.add_argument("--iterations", "-n", type=int, default=10, help="Number of benchmark iterations (default: 10)")
+    p_bench.add_argument("--warmup", "-w", type=int, default=2, help="Warmup iterations before timing (default: 2)")
+    p_bench.add_argument("--allow-failure", action="store_true", help="Do not abort if command returns non-zero code")
+    p_bench.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # eventloop
+    p_ev = subparsers.add_parser("eventloop", help="Measure event-loop latency and scheduling lag spikes")
+    p_ev.add_argument("--duration", "-d", type=float, default=2.0, help="Duration of latency probe in seconds (default: 2.0)")
+    p_ev.add_argument("--interval-ms", "-i", type=float, default=10.0, help="Target tick interval in ms (default: 10.0)")
+    p_ev.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # heap
+    p_heap = subparsers.add_parser("heap", help="Analyze heap breakdown and allocation distribution")
+    p_heap.add_argument("file", help="Path to heap JSON snapshot file")
+    p_heap.add_argument("--limit", type=int, default=10, help="Top N allocations to display (default: 10)")
+    p_heap.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args()
+
+    if args.subcommand == "profile":
+        return run_profile(args)
+    elif args.subcommand == "bench":
+        return run_bench(args)
+    elif args.subcommand == "eventloop":
+        return run_eventloop(args)
+    elif args.subcommand == "heap":
+        return run_heap(args)
+    else:
+        parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

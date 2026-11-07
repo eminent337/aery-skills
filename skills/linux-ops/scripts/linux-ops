@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+linux-ops: Zero-dependency Resident System Services, Daemon Automation, and Watchdog CLI.
+
+Designed for generating production-hardened systemd units, supervising background processes,
+inspecting service health, and validating cron automation schedules.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def generate_systemd_unit(
+    name: str,
+    exec_cmd: str,
+    working_dir: Optional[str] = None,
+    user: Optional[str] = None,
+    restart: str = "always",
+    restart_sec: int = 5,
+    memory_max: Optional[str] = None,
+    harden: bool = True,
+    description: Optional[str] = None,
+) -> str:
+    """Generate a hardened systemd service unit string."""
+    desc = description or f"{name} background service"
+    lines = [
+        "[Unit]",
+        f"Description={desc}",
+        "After=network.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart={exec_cmd}",
+    ]
+
+    if working_dir:
+        lines.append(f"WorkingDirectory={working_dir}")
+    if user:
+        lines.append(f"User={user}")
+
+    lines.append(f"Restart={restart}")
+    lines.append(f"RestartSec={restart_sec}")
+
+    if memory_max:
+        lines.append(f"MemoryMax={memory_max}")
+
+    if harden:
+        lines.extend([
+            "",
+            "# Security Hardening Directives",
+            "NoNewPrivileges=true",
+            "ProtectSystem=full",
+            "ProtectHome=read-only",
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectControlGroups=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelTunables=true",
+            "RestrictRealtime=true",
+            "RestrictSUIDSGID=true",
+            "LockPersonality=true",
+        ])
+
+    lines.extend([
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "",
+    ])
+
+    return "\n".join(lines)
+
+
+def run_daemon(args: argparse.Namespace) -> int:
+    """Generate systemd service unit."""
+    if not args.exec_cmd:
+        sys.stderr.write("Error: --exec command is required to generate a service unit.\n")
+        return 1
+
+    name = args.name or "my-service"
+    unit_content = generate_systemd_unit(
+        name=name,
+        exec_cmd=args.exec_cmd,
+        working_dir=args.working_dir or os.getcwd(),
+        user=args.user,
+        restart=args.restart,
+        restart_sec=args.restart_sec,
+        memory_max=args.memory_max,
+        harden=not args.no_harden,
+        description=args.desc,
+    )
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(unit_content)
+            print(f"Successfully wrote systemd unit to: {args.output}")
+        except Exception as e:
+            sys.stderr.write(f"Error writing file '{args.output}': {e}\n")
+            return 1
+    elif args.json:
+        print(json.dumps({
+            "service_name": f"{name}.service",
+            "exec_cmd": args.exec_cmd,
+            "unit_content": unit_content,
+            "install_path_system": f"/etc/systemd/system/{name}.service",
+            "install_path_user": f"~/.config/systemd/user/{name}.service",
+        }, indent=2))
+    else:
+        print(unit_content)
+
+    return 0
+
+
+def run_status(args: argparse.Namespace) -> int:
+    """Check status of a systemd service or list active background services."""
+    unit = args.unit
+    cmd = ["systemctl", "status", unit, "--no-pager"] if unit else ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager"]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        is_active = (res.returncode == 0)
+
+        if args.json:
+            print(json.dumps({
+                "unit": unit or "running-services",
+                "active": is_active,
+                "returncode": res.returncode,
+                "output": res.stdout.strip(),
+            }, indent=2))
+        else:
+            print(res.stdout if res.stdout else res.stderr)
+        return res.returncode
+    except Exception as e:
+        sys.stderr.write(f"Error checking systemctl status: {e}\n")
+        return 1
+
+
+def run_watchdog(args: argparse.Namespace) -> int:
+    """Supervise a command and restart it if it exits unexpectedly."""
+    cmd = args.cmd
+    max_restarts = max(1, int(args.max_restarts))
+    cooldown = max(0.1, float(args.cooldown))
+
+    if not cmd:
+        sys.stderr.write("Error: --cmd is required for watchdog supervision.\n")
+        return 1
+
+    if args.dry_run:
+        print(f"[Watchdog DRY RUN] Would supervise: '{cmd}' (max_restarts={max_restarts}, cooldown={cooldown}s)")
+        return 0
+
+    restarts = 0
+    sys.stdout.write(f"[Watchdog] Starting supervisor for '{cmd}' (Max restarts: {max_restarts})\n")
+    sys.stdout.flush()
+
+    while restarts < max_restarts:
+        t0 = time.time()
+        proc = subprocess.Popen(cmd, shell=True)
+        ret = proc.wait()
+        uptime = time.time() - t0
+
+        if ret == 0:
+            print(f"[Watchdog] Command exited cleanly with code 0 after {uptime:.1f}s. Exiting supervisor.")
+            return 0
+
+        restarts += 1
+        print(f"[Watchdog ALERT] Process died with code {ret} (Uptime: {uptime:.1f}s). Restart {restarts}/{max_restarts} in {cooldown}s...")
+        time.sleep(cooldown)
+
+    print(f"[Watchdog CRITICAL] Exceeded max restart limit ({max_restarts}). Halting.")
+    return 2
+
+
+def parse_cron_field(field: str, min_val: int, max_val: int) -> List[int]:
+    """Parse a single cron field into matching integers."""
+    if field == "*":
+        return list(range(min_val, max_val + 1))
+    values = set()
+    for part in field.split(","):
+        if "/" in part:
+            sub, step_str = part.split("/", 1)
+            step = int(step_str)
+            sub_vals = parse_cron_field(sub, min_val, max_val)
+            for v in sub_vals[::step]:
+                values.add(v)
+        elif "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            for v in range(start, end + 1):
+                if min_val <= v <= max_val:
+                    values.add(v)
+        else:
+            v = int(part)
+            if min_val <= v <= max_val:
+                values.add(v)
+    return sorted(list(values))
+
+
+def run_cron(args: argparse.Namespace) -> int:
+    """Validate and explain a 5-field cron expression."""
+    expr = args.expression.strip()
+    fields = expr.split()
+
+    if len(fields) != 5:
+        sys.stderr.write(f"Error: Cron expression must contain exactly 5 fields (got {len(fields)}): '{expr}'\n")
+        sys.stderr.write("Expected format: <minute> <hour> <day_of_month> <month> <day_of_week>\n")
+        return 1
+
+    try:
+        minutes = parse_cron_field(fields[0], 0, 59)
+        hours = parse_cron_field(fields[1], 0, 23)
+        dom = parse_cron_field(fields[2], 1, 31)
+        months = parse_cron_field(fields[3], 1, 12)
+        dow = parse_cron_field(fields[4], 0, 7)
+    except Exception as e:
+        sys.stderr.write(f"Error: Invalid cron syntax in '{expr}': {e}\n")
+        return 1
+
+    # Human translation summary
+    desc_parts = []
+    if fields[0] == "*":
+        desc_parts.append("Every minute")
+    elif fields[0].startswith("*/"):
+        desc_parts.append(f"Every {fields[0][2:]} minutes")
+    else:
+        desc_parts.append(f"At minute {fields[0]}")
+
+    if fields[1] == "*":
+        desc_parts.append("of every hour")
+    elif fields[1].startswith("*/"):
+        desc_parts.append(f"every {fields[1][2:]} hours")
+    else:
+        desc_parts.append(f"past hour {fields[1]}:00")
+
+    if fields[4] != "*":
+        desc_parts.append(f"on day-of-week {fields[4]}")
+    if fields[2] != "*":
+        desc_parts.append(f"on day-of-month {fields[2]}")
+
+    human_description = " ".join(desc_parts)
+
+    result = {
+        "expression": expr,
+        "valid": True,
+        "human_description": human_description,
+        "parsed_fields": {
+            "minute": fields[0],
+            "hour": fields[1],
+            "day_of_month": fields[2],
+            "month": fields[3],
+            "day_of_week": fields[4],
+        },
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Cron Expression Analysis: '{expr}' ===")
+        print(f"Status:      [VALID]")
+        print(f"Schedule:    {human_description}")
+        print(f"Fields:      Min={fields[0]} | Hour={fields[1]} | DOM={fields[2]} | Mon={fields[3]} | DOW={fields[4]}")
+
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="linux-ops",
+        description="Zero-dependency Linux resident system services, daemon automation, and watchdog CLI.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+
+    # daemon
+    p_daemon = subparsers.add_parser("daemon", help="Generate production-hardened systemd service unit")
+    p_daemon.add_argument("--name", "-n", default="aery-service", help="Service name identifier (default: aery-service)")
+    p_daemon.add_argument("--exec", dest="exec_cmd", required=True, help="Command executable to run")
+    p_daemon.add_argument("--working-dir", "-w", help="Working directory for service")
+    p_daemon.add_argument("--user", "-u", help="User to run service as")
+    p_daemon.add_argument("--restart", choices=["always", "on-failure", "no"], default="always", help="Restart policy")
+    p_daemon.add_argument("--restart-sec", type=int, default=5, help="Seconds before restarting (default: 5)")
+    p_daemon.add_argument("--memory-max", help="Memory limit cgroup (e.g. 512M, 1G)")
+    p_daemon.add_argument("--no-harden", action="store_true", help="Omit security sandboxing directives")
+    p_daemon.add_argument("--desc", help="Service description string")
+    p_daemon.add_argument("--output", "-o", help="Write service file to path")
+    p_daemon.add_argument("--json", action="store_true", help="Output metadata in JSON format")
+
+    # status
+    p_status = subparsers.add_parser("status", help="Inspect status of systemd units")
+    p_status.add_argument("unit", nargs="?", help="Specific service unit name (e.g. sshd, nginx)")
+    p_status.add_argument("--json", action="store_true", help="Output status in JSON format")
+
+    # watchdog
+    p_watchdog = subparsers.add_parser("watchdog", help="Supervise a command and restart on crash")
+    p_watchdog.add_argument("--cmd", "-c", required=True, help="Command string to supervise")
+    p_watchdog.add_argument("--max-restarts", type=int, default=3, help="Max restarts before giving up (default: 3)")
+    p_watchdog.add_argument("--cooldown", type=float, default=1.0, help="Seconds to wait between restarts (default: 1.0)")
+    p_watchdog.add_argument("--dry-run", action="store_true", help="Simulate supervisor without executing")
+
+    # cron
+    p_cron = subparsers.add_parser("cron", help="Validate and explain cron expressions")
+    p_cron.add_argument("expression", help="5-field cron expression string (e.g. '*/15 * * * *')")
+    p_cron.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args()
+
+    if args.subcommand == "daemon":
+        return run_daemon(args)
+    elif args.subcommand == "status":
+        return run_status(args)
+    elif args.subcommand == "watchdog":
+        return run_watchdog(args)
+    elif args.subcommand == "cron":
+        return run_cron(args)
+    else:
+        parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

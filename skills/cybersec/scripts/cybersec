@@ -1,0 +1,2395 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+"""
+cybersec - Zero-dependency CLI engine for cybersecurity operations.
+
+Covers scanning, dependency auditing, host hardening analysis, triage, and automated patching.
+Standard library only: sys, os, argparse, json.
+"""
+
+import argparse
+from collections import Counter
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import socket
+import stat
+import subprocess
+import sys
+from urllib.parse import unquote, urlparse
+
+SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+}
+
+BINARY_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".pyc",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".bin",
+    ".iso",
+    ".dmg",
+    ".class",
+    ".jar",
+    ".war",
+}
+
+SECRET_RULES = [
+    {
+        "type": "ANTHROPIC_API_KEY",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"sk-ant-[a-zA-Z0-9_-]{32,}"),
+        "description": "Anthropic API key detected",
+    },
+    {
+        "type": "OPENAI_API_KEY",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
+        "description": "OpenAI API key detected",
+    },
+    {
+        "type": "AWS_ACCESS_KEY",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"AKIA[0-9A-Z]{16}"),
+        "description": "AWS access key ID detected",
+    },
+    {
+        "type": "GITHUB_PAT",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+        "description": "GitHub Personal Access Token detected",
+    },
+    {
+        "type": "GOOGLE_API_KEY",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"AIzaSy[0-9A-Za-z_-]{33}"),
+        "description": "Google API key detected",
+    },
+    {
+        "type": "PRIVATE_KEY",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        "description": "Private cryptographic key detected",
+    },
+    {
+        "type": "JWT_TOKEN",
+        "severity": "CRITICAL",
+        "pattern": re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}"),
+        "description": "JSON Web Token (JWT) detected",
+    },
+]
+
+SAST_RULES = [
+    {
+        "type": "COMMAND_INJECTION",
+        "severity": "HIGH",
+        "pattern": re.compile(
+            r"os\.system\(|subprocess\.(Popen|run|call)\([^)]*shell\s*=\s*True|child_process\.(exec|execSync)\(|(?<!\w)eval\("
+        ),
+        "description": "Potential command injection or dynamic code evaluation",
+    },
+    {
+        "type": "SQL_INJECTION",
+        "severity": "HIGH",
+        "pattern": re.compile(
+            r"(execute|query)\(\s*(?:"
+            r"""f"[^"]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)[^"]*\{|"""
+            r"""f"[^"]*\{[^"]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)|"""
+            r"""f'[^']*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)[^']*\{|"""
+            r"""f'[^']*\{[^']*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)|"""
+            r""""[^"]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)[^"]*"\s*\+|"""
+            r"""'[^']*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)[^']*'\s*\+|"""
+            r"""\+\s*"[^"]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)|"""
+            r"""\+\s*'[^']*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)|"""
+            r"""`[^`]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)[^`]*\$\{|"""
+            r"""`[^`]*\$\{[^`]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)"""
+            r")",
+            re.IGNORECASE,
+        ),
+        "description": "Potential SQL injection via raw or unparameterized query",
+    },
+    {
+        "type": "PATH_TRAVERSAL",
+        "severity": "MEDIUM",
+        "pattern": re.compile(
+            r"open\([^)]*\+[^)]*\)|fs\.(readFile|readFileSync|createReadStream)\([^)]*\+"
+        ),
+        "description": "Potential path traversal via unconstrained file path concatenation",
+    },
+    {
+        "type": "INSECURE_CRYPTO",
+        "severity": "MEDIUM",
+        "pattern": re.compile(
+            r"hashlib\.(md5|sha1)\(|crypto\.createHash\([\"'](md5|sha1)[\"']\)|pickle\.loads\("
+        ),
+        "description": "Insecure cryptographic hash or unsafe deserialization",
+    },
+]
+
+
+def mask_secret(secret_str: str) -> str:
+    """Mask secret value for safe reporting."""
+    if secret_str.startswith("-----BEGIN"):
+        return "-----BEGIN***"
+    if secret_str.startswith("AKIA"):
+        return "AKIA***"
+    if secret_str.startswith("sk-ant-"):
+        return "sk-ant-***"
+    if secret_str.startswith("sk-"):
+        return "sk-***"
+    if secret_str.startswith("ghp_"):
+        return "ghp_***"
+    if secret_str.startswith("AIzaSy"):
+        return "AIzaSy***"
+    if secret_str.startswith("eyJ"):
+        return "eyJ***"
+    if len(secret_str) > 4:
+        return secret_str[:4] + "***"
+    return "***"
+
+
+def is_binary_file(file_path: str) -> bool:
+    """Check if a file is binary by extension or null-byte heuristic."""
+    _, ext = os.path.splitext(file_path)
+    if ext.lower() in BINARY_EXTENSIONS:
+        return True
+    try:
+        with open(file_path, "rb") as f:
+            chunk = f.read(1024)
+            return b"\0" in chunk
+    except Exception:
+        return True
+
+
+def collect_files(target_path: str) -> list:
+    """Collect all scannable files from target path, skipping ignored directories and binaries."""
+    if os.path.isfile(target_path):
+        return [target_path] if not is_binary_file(target_path) else []
+
+    collected = []
+    for root, dirs, files in os.walk(target_path):
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIRS and d != ".git"
+        ]
+        for f in sorted(files):
+            full_path = os.path.join(root, f)
+            if not is_binary_file(full_path):
+                collected.append(full_path)
+    return collected
+
+
+def scan_file(file_path: str, base_path: str):
+    """Scan a single file for secrets and SAST vulnerabilities."""
+    secrets = []
+    vulnerabilities = []
+
+    if os.path.isdir(base_path):
+        rel_path = os.path.relpath(file_path, base_path)
+    else:
+        rel_path = os.path.basename(file_path)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line_no, raw_line in enumerate(f, start=1):
+                line = raw_line.rstrip("\r\n")
+                clean_line = line.strip()
+                if not clean_line:
+                    continue
+
+                matched_spans = set()
+                # Check secret rules
+                for rule in SECRET_RULES:
+                    for match in rule["pattern"].finditer(line):
+                        span = match.span()
+                        if any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in matched_spans):
+                            continue
+                        matched_spans.add(span)
+                        matched_text = match.group(0)
+                        secrets.append({
+                            "type": rule["type"],
+                            "severity": rule["severity"],
+                            "file": rel_path,
+                            "line": line_no,
+                            "match": mask_secret(matched_text),
+                            "snippet": clean_line,
+                        })
+
+                # Check SAST rules
+                for rule in SAST_RULES:
+                    if rule["pattern"].search(line):
+                        vulnerabilities.append({
+                            "type": rule["type"],
+                            "severity": rule["severity"],
+                            "file": rel_path,
+                            "line": line_no,
+                            "description": rule["description"],
+                            "snippet": clean_line,
+                        })
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    return secrets, vulnerabilities
+
+
+def print_human_report(target_path: str, secrets: list, vulnerabilities: list) -> None:
+    """Print clean terminal table of findings."""
+    total = len(secrets) + len(vulnerabilities)
+    if total == 0:
+        print(f"Target: {target_path}")
+        print("No secrets or SAST vulnerabilities detected.")
+        return
+
+    print(f"Target: {target_path}")
+    print(f"Findings: {total} issues found ({len(secrets)} secrets, {len(vulnerabilities)} vulnerabilities)\n")
+    print("[SEV] Type | File:Line | Snippet")
+    print("-" * 80)
+    for s in secrets:
+        snippet = s.get("snippet", s["match"])
+        if len(snippet) > 60:
+            snippet = snippet[:57] + "..."
+        print(f"[{s['severity']}] {s['type']} | {s['file']}:{s['line']} | {snippet}")
+    for v in vulnerabilities:
+        snippet = v.get("snippet", v["description"])
+        if len(snippet) > 60:
+            snippet = snippet[:57] + "..."
+        print(f"[{v['severity']}] {v['type']} | {v['file']}:{v['line']} | {snippet}")
+
+
+def handle_scan(args) -> int:
+    """Handle scan subcommand execution."""
+    target_path = args.path
+    if not os.path.exists(target_path):
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "path": target_path,
+                "secrets": [],
+                "vulnerabilities": [],
+                "summary": {"secrets_count": 0, "vulnerabilities_count": 0},
+                "error": f"Path not found: {target_path}",
+            }, indent=2))
+        else:
+            sys.stderr.write(f"Error: Path '{target_path}' does not exist.\n")
+        return 1
+
+    files = collect_files(target_path)
+    all_secrets = []
+    all_vulns = []
+
+    for fpath in files:
+        sec, vuln = scan_file(fpath, target_path)
+        all_secrets.extend(sec)
+        all_vulns.extend(vuln)
+
+    if getattr(args, "json", False):
+        report = {
+            "path": target_path,
+            "secrets": [
+                {
+                    "type": s["type"],
+                    "severity": s["severity"],
+                    "file": s["file"],
+                    "line": s["line"],
+                    "match": s["match"],
+                }
+                for s in all_secrets
+            ],
+            "vulnerabilities": [
+                {
+                    "type": v["type"],
+                    "severity": v["severity"],
+                    "file": v["file"],
+                    "line": v["line"],
+                    "description": v["description"],
+                }
+                for v in all_vulns
+            ],
+            "summary": {
+                "secrets_count": len(all_secrets),
+                "vulnerabilities_count": len(all_vulns),
+            },
+        }
+        print(json.dumps(report, indent=2))
+    else:
+        print_human_report(target_path, all_secrets, all_vulns)
+
+    return 0
+
+
+LIFECYCLE_HOOK_NAMES = {
+    "preinstall",
+    "install",
+    "postinstall",
+    "prepublish",
+    "prepublishOnly",
+    "prepare",
+    "prepack",
+    "postpack",
+}
+
+TRUSTED_PYPI_HOSTS = (
+    "pypi.org",
+    "pythonhosted.org",
+    "files.pythonhosted.org",
+    "pypi.python.org",
+)
+
+
+def audit_package_json(content: str, manifest_path: str):
+    """Audit package.json for lifecycle hooks and unpinned dependencies."""
+    lifecycle_hooks = []
+    unpinned_dependencies = []
+    vulnerabilities = []
+
+    try:
+        data = json.loads(content)
+    except Exception as e:
+        vulnerabilities.append({
+            "type": "PARSE_ERROR",
+            "severity": "HIGH",
+            "description": f"Failed to parse package.json: {str(e)}",
+        })
+        return lifecycle_hooks, unpinned_dependencies, vulnerabilities
+
+    # 1. Audit lifecycle hooks
+    scripts = data.get("scripts", {})
+    if isinstance(scripts, dict):
+        for script_name, command in scripts.items():
+            if not isinstance(command, str):
+                continue
+            s_name_lower = script_name.lower()
+            if s_name_lower in LIFECYCLE_HOOK_NAMES:
+                # Inspect command for suspicious indicators
+                is_pipe_to_shell = bool(
+                    re.search(r"\|\s*(bash|sh|zsh|powershell|cmd(\.exe)?)\b", command, re.IGNORECASE)
+                    or re.search(r"\b(curl|wget)\b.*\|", command, re.IGNORECASE)
+                )
+                is_remote_download = bool(
+                    re.search(r"\b(curl|wget)\b|https?://", command, re.IGNORECASE)
+                )
+                is_shell_eval = bool(
+                    re.search(r"\b(bash|sh|powershell|cmd(\.exe)?|eval|base64)\b", command, re.IGNORECASE)
+                )
+
+                if is_pipe_to_shell:
+                    lifecycle_hooks.append({
+                        "script": script_name,
+                        "command": command,
+                        "severity": "CRITICAL",
+                        "description": "Lifecycle hook executes remote script or pipe to shell",
+                    })
+                elif is_remote_download:
+                    lifecycle_hooks.append({
+                        "script": script_name,
+                        "command": command,
+                        "severity": "HIGH",
+                        "description": "Lifecycle hook downloads remote resource via network",
+                    })
+                elif is_shell_eval:
+                    lifecycle_hooks.append({
+                        "script": script_name,
+                        "command": command,
+                        "severity": "HIGH",
+                        "description": "Lifecycle hook invokes shell interpreter or dynamic evaluation",
+                    })
+
+    # 2. Audit unpinned dependencies
+    dep_fields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
+    for field in dep_fields:
+        deps = data.get(field, {})
+        if isinstance(deps, dict):
+            for dep_name, ver in deps.items():
+                if not isinstance(ver, str):
+                    continue
+                v = ver.strip()
+                if v in ("*", "latest", "", "x") or v.startswith("*") or v.lower() == "latest" or not any(c.isdigit() for c in v):
+                    if dep_name not in unpinned_dependencies:
+                        unpinned_dependencies.append(dep_name)
+
+    return lifecycle_hooks, unpinned_dependencies, vulnerabilities
+
+
+def audit_requirements_txt(content: str, manifest_path: str):
+    """Audit requirements.txt for unpinned packages and suspicious index URLs."""
+    suspicious_indices = []
+    unpinned_dependencies = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Check for index URL directives
+        idx_match = re.search(r"(?:--extra-index-url|--index-url|-i)\s*=?\s*([^\s]+)", line)
+        if idx_match:
+            url = idx_match.group(1).strip()
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            is_http = parsed.scheme.lower() == "http" or url.startswith("http://")
+            is_trusted = any(host == trusted or host.endswith("." + trusted) for trusted in TRUSTED_PYPI_HOSTS)
+            if is_http or not is_trusted:
+                suspicious_indices.append({
+                    "url": url,
+                    "severity": "CRITICAL" if is_http else "HIGH",
+                    "description": "Untrusted or unencrypted package index URL (potential dependency confusion / MITM)",
+                })
+            continue
+
+        if line.startswith("-"):
+            continue
+
+        # Strip inline comments and environment markers
+        dep_line = line.split("#")[0].split(";")[0].strip()
+        if not dep_line:
+            continue
+
+        # Pinned packages must have '=='
+        if "==" not in dep_line:
+            pkg_name = re.split(r"[><=~!~@\s]", dep_line)[0].strip()
+            if pkg_name and pkg_name not in unpinned_dependencies:
+                unpinned_dependencies.append(pkg_name)
+
+    return suspicious_indices, unpinned_dependencies
+
+
+def audit_pipfile(content: str, manifest_path: str):
+    """Audit Pipfile for unpinned dependencies and suspicious source URLs."""
+    suspicious_indices = []
+    unpinned_dependencies = []
+
+    # Check for source URLs
+    url_matches = re.findall(r"url\s*=\s*[\"']([^\"']+)[\"']", content)
+    for url in url_matches:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        is_http = parsed.scheme.lower() == "http" or url.startswith("http://")
+        is_trusted = any(host == trusted or host.endswith("." + trusted) for trusted in TRUSTED_PYPI_HOSTS)
+        if is_http or not is_trusted:
+            suspicious_indices.append({
+                "url": url,
+                "severity": "CRITICAL" if is_http else "HIGH",
+                "description": "Untrusted or unencrypted package index URL in Pipfile",
+            })
+
+    # Check packages and dev-packages sections
+    in_packages = False
+    for raw_line in content.splitlines():
+        sline = raw_line.strip()
+        if not sline or sline.startswith("#"):
+            continue
+
+        if sline.startswith("["):
+            sec = sline.lower()
+            in_packages = "packages" in sec
+            continue
+
+        if in_packages and "=" in sline:
+            dep_sline = sline.split("#")[0].strip()
+            if not dep_sline or "=" not in dep_sline:
+                continue
+            parts = dep_sline.split("=", 1)
+            pkg = parts[0].strip()
+            val = parts[1].strip()
+            if "==" not in val or "*" in val:
+                if pkg and pkg not in unpinned_dependencies:
+                    unpinned_dependencies.append(pkg)
+
+    return suspicious_indices, unpinned_dependencies
+
+
+def audit_cargo_manifest(content: str, manifest_path: str):
+    """Audit Cargo.toml for unpinned dependencies, insecure git dependencies, and patch overrides."""
+    unpinned_dependencies = []
+    vulnerabilities = []
+
+    current_table_dep = None
+    table_header_re = re.compile(
+        r"^\[(?:target\.[^\]]+\.)?(?:dependencies|dev-dependencies|build-dependencies)\.([a-zA-Z0-9_-]+)\]",
+        re.IGNORECASE,
+    )
+
+    for raw_line in content.splitlines():
+        sline = raw_line.strip()
+        if not sline or sline.startswith("#"):
+            continue
+
+        # Check section headers
+        if sline.startswith("["):
+            m_table = table_header_re.match(sline)
+            if m_table:
+                current_table_dep = m_table.group(1).strip()
+            else:
+                current_table_dep = None
+
+            # Check for patch or replace overrides
+            if re.match(r"^\[patch\..*\]", sline) or re.match(r"^\[replace\]", sline):
+                vulnerabilities.append({
+                    "type": "SUSPICIOUS_OVERRIDE",
+                    "severity": "MEDIUM",
+                    "description": f"Suspicious patch or replace override in Cargo manifest: {sline}",
+                })
+            continue
+
+        # Check for git dependencies over HTTP
+        if re.search(r"git\s*=\s*[\"']http://[^\"']+[\"']", sline, re.IGNORECASE):
+            vulnerabilities.append({
+                "type": "INSECURE_DEPENDENCY",
+                "severity": "HIGH",
+                "description": f"Git dependency specified over insecure HTTP transport: {sline}",
+            })
+
+        # Check for unpinned versions
+        if current_table_dep:
+            if re.match(r"^\s*version\s*=\s*[\"']\*[\"']", sline):
+                if current_table_dep not in unpinned_dependencies:
+                    unpinned_dependencies.append(current_table_dep)
+        else:
+            m_simple = re.match(r"^\s*([a-zA-Z0-9_-]+)\s*=\s*[\"']\*[\"']", sline)
+            if m_simple:
+                pkg = m_simple.group(1).strip()
+                if pkg not in unpinned_dependencies:
+                    unpinned_dependencies.append(pkg)
+            else:
+                m_inline = re.match(r"^\s*([a-zA-Z0-9_-]+)\s*=.*version\s*=\s*[\"']\*[\"']", sline)
+                if m_inline:
+                    pkg = m_inline.group(1).strip()
+                    if pkg not in unpinned_dependencies:
+                        unpinned_dependencies.append(pkg)
+
+    return unpinned_dependencies, vulnerabilities
+
+
+def audit_deps(manifest_path: str) -> dict:
+    """Audit software dependencies and package manifests for security risks."""
+    target_file = manifest_path
+    if os.path.isdir(manifest_path):
+        for candidate in ["package.json", "requirements.txt", "Pipfile", "Cargo.toml"]:
+            cand_path = os.path.join(manifest_path, candidate)
+            if os.path.isfile(cand_path):
+                target_file = cand_path
+                break
+
+    basename = os.path.basename(target_file).lower()
+    manifest_type = "unknown"
+    lifecycle_hooks = []
+    unpinned_dependencies = []
+    suspicious_indices = []
+    vulnerabilities = []
+
+    try:
+        with open(target_file, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        return {
+            "manifest": target_file,
+            "manifest_type": manifest_type,
+            "lifecycle_hooks": [],
+            "unpinned_dependencies": [],
+            "suspicious_indices": [],
+            "vulnerabilities": [{"type": "READ_ERROR", "severity": "HIGH", "description": str(e)}],
+            "summary": {
+                "lifecycle_hooks_count": 0,
+                "unpinned_count": 0,
+                "suspicious_indices_count": 0,
+                "vulnerabilities_count": 1,
+                "total_issues": 1,
+            },
+        }
+
+    if basename == "package.json":
+        manifest_type = "npm"
+        hooks, unpinned, vulns = audit_package_json(content, target_file)
+        lifecycle_hooks.extend(hooks)
+        unpinned_dependencies.extend(unpinned)
+        vulnerabilities.extend(vulns)
+    elif basename in ("requirements.txt", "requirements-dev.txt") or (
+        basename.endswith(".txt") and ("requirement" in basename or "deps" in basename or "--" in content or "==" in content)
+    ):
+        manifest_type = "pypi"
+        indices, unpinned = audit_requirements_txt(content, target_file)
+        suspicious_indices.extend(indices)
+        unpinned_dependencies.extend(unpinned)
+    elif basename in ("pipfile", "pipfile.lock"):
+        manifest_type = "pypi"
+        indices, unpinned = audit_pipfile(content, target_file)
+        suspicious_indices.extend(indices)
+        unpinned_dependencies.extend(unpinned)
+    elif basename in ("cargo.toml", "cargo.lock"):
+        manifest_type = "cargo"
+        unpinned, vulns = audit_cargo_manifest(content, target_file)
+        unpinned_dependencies.extend(unpinned)
+        vulnerabilities.extend(vulns)
+    else:
+        # Heuristic detection based on content
+        if "package.json" in basename or '"dependencies"' in content or '"scripts"' in content:
+            manifest_type = "npm"
+            hooks, unpinned, vulns = audit_package_json(content, target_file)
+            lifecycle_hooks.extend(hooks)
+            unpinned_dependencies.extend(unpinned)
+            vulnerabilities.extend(vulns)
+        elif "[package]" in content or "[dependencies]" in content:
+            manifest_type = "cargo"
+            unpinned, vulns = audit_cargo_manifest(content, target_file)
+            unpinned_dependencies.extend(unpinned)
+            vulnerabilities.extend(vulns)
+        else:
+            manifest_type = "pypi"
+            indices, unpinned = audit_requirements_txt(content, target_file)
+            suspicious_indices.extend(indices)
+            unpinned_dependencies.extend(unpinned)
+
+    total_issues = (
+        len(lifecycle_hooks)
+        + len(unpinned_dependencies)
+        + len(suspicious_indices)
+        + len(vulnerabilities)
+    )
+
+    return {
+        "manifest": target_file,
+        "manifest_type": manifest_type,
+        "lifecycle_hooks": lifecycle_hooks,
+        "unpinned_dependencies": unpinned_dependencies,
+        "suspicious_indices": suspicious_indices,
+        "vulnerabilities": vulnerabilities,
+        "summary": {
+            "lifecycle_hooks_count": len(lifecycle_hooks),
+            "unpinned_count": len(unpinned_dependencies),
+            "suspicious_indices_count": len(suspicious_indices),
+            "vulnerabilities_count": len(vulnerabilities),
+            "total_issues": total_issues,
+        },
+    }
+
+
+def print_deps_human_report(report: dict) -> None:
+    """Print clean terminal table of dependency audit findings."""
+    manifest = report["manifest"]
+    summary = report["summary"]
+    total = summary["total_issues"]
+
+    print(f"Manifest: {manifest}")
+    if total == 0:
+        print("No dependency risks or malicious lifecycle hooks detected.")
+        return
+
+    print(f"Findings: {total} issues found across dependencies and lifecycle hooks\n")
+
+    if report["lifecycle_hooks"]:
+        print("Lifecycle Hook Risks:")
+        print("[SEV] Hook | Command | Description")
+        print("-" * 80)
+        for h in report["lifecycle_hooks"]:
+            cmd = h["command"]
+            if len(cmd) > 50:
+                cmd = cmd[:47] + "..."
+            print(f"[{h['severity']}] {h['script']} | {cmd} | {h['description']}")
+        print()
+
+    if report["suspicious_indices"]:
+        print("Suspicious Package Indices:")
+        print("[SEV] URL | Description")
+        print("-" * 80)
+        for idx in report["suspicious_indices"]:
+            print(f"[{idx['severity']}] {idx['url']} | {idx['description']}")
+        print()
+
+    if report["unpinned_dependencies"]:
+        print("Unpinned Dependencies:")
+        for dep in report["unpinned_dependencies"]:
+            print(f"  - {dep}")
+        print()
+
+    if report.get("vulnerabilities"):
+        print("Manifest Vulnerabilities:")
+        print("[SEV] Type | Description")
+        print("-" * 80)
+        for v in report["vulnerabilities"]:
+            print(f"[{v.get('severity', 'HIGH')}] {v.get('type', 'VULN')} | {v.get('description', '')}")
+        print()
+
+
+def handle_deps(args) -> int:
+    """Handle deps subcommand execution."""
+    manifest_path = args.manifest
+    if not os.path.exists(manifest_path):
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "manifest": manifest_path,
+                "lifecycle_hooks": [],
+                "unpinned_dependencies": [],
+                "suspicious_indices": [],
+                "vulnerabilities": [],
+                "summary": {
+                    "lifecycle_hooks_count": 0,
+                    "unpinned_count": 0,
+                    "suspicious_indices_count": 0,
+                    "vulnerabilities_count": 0,
+                    "total_issues": 0,
+                },
+                "error": f"Manifest not found: {manifest_path}",
+            }, indent=2))
+        else:
+            sys.stderr.write(f"Error: Manifest '{manifest_path}' does not exist.\n")
+        return 1
+
+    report = audit_deps(manifest_path)
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+    else:
+        print_deps_human_report(report)
+
+    return 0
+
+
+GTFOBINS_SET = {
+    "bash", "sh", "dash", "zsh", "python", "python3", "perl", "ruby",
+    "find", "vim", "vi", "nano", "cp", "mv", "awk", "sed", "tar", "zip",
+    "less", "more", "env", "nmap", "pkexec", "sudo", "su", "curl", "wget",
+    "tee", "chmod", "chown", "gdb", "node", "php",
+}
+
+CRITICAL_PATHS = [
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/crontab",
+    "/etc/cron.d",
+    "/root/.ssh",
+]
+
+
+def get_system_info() -> dict:
+    """Gather host system metadata."""
+    hostname = platform.node() or socket.gethostname() or "unknown"
+    plat = platform.system() or sys.platform
+    try:
+        kernel = os.uname().release
+    except (AttributeError, OSError):
+        kernel = platform.release() or "unknown"
+
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        try:
+            user = os.getlogin()
+        except Exception:
+            try:
+                import pwd
+                user = pwd.getpwuid(os.getuid()).pw_name
+            except Exception:
+                user = "unknown"
+
+    return {
+        "hostname": hostname,
+        "platform": plat,
+        "kernel": kernel,
+        "current_user": user,
+    }
+
+
+def get_listening_ports() -> list:
+    """Extract active listening network ports from procfs or netstat/ss fallback."""
+    ports = []
+    seen = set()
+
+    # Read /proc/net/tcp and /proc/net/tcp6
+    has_proc = os.path.exists("/proc/net/tcp") or os.path.exists("/proc/net/tcp6")
+    if has_proc:
+        for proto, proc_file in [("tcp", "/proc/net/tcp"), ("tcp", "/proc/net/tcp6")]:
+            if not os.path.exists(proc_file):
+                continue
+            try:
+                with open(proc_file, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                for line in lines[1:]:
+                    parts = line.strip().split()
+                    if len(parts) < 4:
+                        continue
+                    local_addr = parts[1]
+                    state = parts[3]
+                    # State 0A represents TCP_LISTEN
+                    if state != "0A":
+                        continue
+                    if ":" not in local_addr:
+                        continue
+                    ip_hex, port_hex = local_addr.split(":", 1)
+                    try:
+                        port = int(port_hex, 16)
+                    except ValueError:
+                        continue
+
+                    ip = None
+                    if len(ip_hex) == 8:
+                        # IPv4 (little-endian bytes)
+                        raw = bytes.fromhex(ip_hex)[::-1]
+                        ip = socket.inet_ntoa(raw)
+                    elif len(ip_hex) == 32:
+                        # IPv6 (4 32-bit words in little-endian order)
+                        raw = bytes.fromhex(ip_hex)
+                        words = [raw[i:i+4][::-1] for i in range(0, 16, 4)]
+                        ip = socket.inet_ntop(socket.AF_INET6, b"".join(words))
+
+                    if ip is not None:
+                        key = (proto, ip, port)
+                        if key not in seen:
+                            seen.add(key)
+                            ports.append({
+                                "proto": proto,
+                                "bind_address": ip,
+                                "port": port,
+                            })
+            except Exception:
+                pass
+
+    if not ports:
+        # Fallback to ss -tuln or netstat -tuln
+        for cmd in [["ss", "-tuln"], ["netstat", "-tuln"]]:
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.splitlines():
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        if parts[0] in ("tcp", "tcp6") and "LISTEN" in parts:
+                            proto = "tcp"
+                            for field in parts:
+                                if ":" in field and not field.endswith(":*"):
+                                    if field.startswith("[") and "]:" in field:
+                                        addr, port_str = field[1:].split("]:", 1)
+                                    elif field.count(":") == 1:
+                                        addr, port_str = field.split(":", 1)
+                                    else:
+                                        addr, port_str = field.rsplit(":", 1)
+                                    try:
+                                        port = int(port_str)
+                                    except ValueError:
+                                        continue
+                                    if addr == "*":
+                                        addr = "0.0.0.0"
+                                    key = (proto, addr, port)
+                                    if key not in seen:
+                                        seen.add(key)
+                                        ports.append({
+                                            "proto": proto,
+                                            "bind_address": addr,
+                                            "port": port,
+                                        })
+                    if ports:
+                        break
+            except Exception:
+                pass
+
+    ports.sort(key=lambda x: (x["port"], x["bind_address"]))
+    return ports
+
+
+def get_suid_binaries(search_dirs=None) -> list:
+    """Identify SUID and SGID binaries and correlate against GTFOBins."""
+    if search_dirs is None:
+        env_dirs = os.environ.get("CYBERSEC_BIN_DIRS")
+        if env_dirs:
+            search_dirs = [d.strip() for d in env_dirs.split(os.pathsep) if d.strip()]
+        else:
+            search_dirs = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin"]
+
+    results = []
+    seen_paths = set()
+
+    for directory in search_dirs:
+        if not os.path.isdir(directory):
+            continue
+        try:
+            for entry in os.scandir(directory):
+                try:
+                    st = entry.stat(follow_symlinks=True)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    mode = st.st_mode
+                    is_suid = bool(mode & 0o4000)
+                    is_sgid = bool(mode & 0o2000)
+                    if not (is_suid or is_sgid):
+                        continue
+
+                    real_path = os.path.realpath(entry.path)
+                    if real_path in seen_paths:
+                        continue
+                    seen_paths.add(real_path)
+
+                    filename = os.path.basename(real_path).lower()
+                    is_gtfo = filename in GTFOBINS_SET
+
+                    results.append({
+                        "path": real_path,
+                        "is_gtfobins": is_gtfo,
+                        "severity": "CRITICAL" if is_gtfo else "INFO",
+                    })
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            continue
+
+    results.sort(key=lambda x: (not x["is_gtfobins"], x["path"]))
+    return results
+
+
+def check_permissions_issues(paths=None) -> list:
+    """Check sensitive system files for world-writable permissions."""
+    if paths is None:
+        env_paths = os.environ.get("CYBERSEC_CRITICAL_PATHS")
+        if env_paths:
+            paths = [p.strip() for p in env_paths.split(os.pathsep) if p.strip()]
+        else:
+            paths = CRITICAL_PATHS
+
+    issues = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            st = os.stat(path)
+            if st.st_mode & 0o002:
+                issues.append({
+                    "path": path,
+                    "issue": "World-writable sensitive path",
+                    "severity": "CRITICAL",
+                    "permissions": oct(st.st_mode)[-4:],
+                })
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    for entry in os.scandir(path):
+                        try:
+                            est = entry.stat(follow_symlinks=False)
+                            if est.st_mode & 0o002:
+                                issues.append({
+                                    "path": entry.path,
+                                    "issue": "World-writable sensitive file",
+                                    "severity": "CRITICAL",
+                                    "permissions": oct(est.st_mode)[-4:],
+                                })
+                        except (OSError, PermissionError):
+                            pass
+                except (OSError, PermissionError):
+                    pass
+        except (OSError, PermissionError):
+            pass
+
+    return issues
+
+
+def check_ssh_hygiene(config_path=None) -> dict:
+    """Check SSH daemon configuration for insecure settings."""
+    if config_path is None:
+        config_path = os.environ.get("CYBERSEC_SSHD_CONFIG", "/etc/ssh/sshd_config")
+
+    result = {
+        "config_file": config_path,
+        "accessible": False,
+        "issues": [],
+    }
+
+    if not os.path.exists(config_path):
+        return result
+
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        result["accessible"] = True
+    except (OSError, PermissionError):
+        return result
+
+    insecure_rules = {
+        "permitrootlogin": {
+            "bad_value": "yes",
+            "setting": "PermitRootLogin",
+            "severity": "HIGH",
+            "description": "PermitRootLogin is set to 'yes' (root login permitted)",
+        },
+        "passwordauthentication": {
+            "bad_value": "yes",
+            "setting": "PasswordAuthentication",
+            "severity": "MEDIUM",
+            "description": "PasswordAuthentication is enabled (password authentication allowed)",
+        },
+        "permitemptypasswords": {
+            "bad_value": "yes",
+            "setting": "PermitEmptyPasswords",
+            "severity": "CRITICAL",
+            "description": "PermitEmptyPasswords is set to 'yes' (accounts with empty passwords can log in)",
+        },
+    }
+
+    seen_settings = set()
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            parts = line.split("=", 1)
+        else:
+            parts = line.split(None, 1)
+
+        if len(parts) < 2:
+            continue
+
+        directive = parts[0].strip().lower()
+        val = parts[1].strip().split()[0].lower() if parts[1].strip() else ""
+
+        if directive in insecure_rules and directive not in seen_settings:
+            seen_settings.add(directive)
+            rule = insecure_rules[directive]
+            if val == rule["bad_value"]:
+                result["issues"].append({
+                    "setting": rule["setting"],
+                    "value": val,
+                    "severity": rule["severity"],
+                    "description": rule["description"],
+                    "line": line_no,
+                })
+
+    return result
+
+
+def audit_host(search_dirs=None, paths=None, config_path=None) -> dict:
+    """Run full host posture audit."""
+    sys_info = get_system_info()
+    listening_ports = get_listening_ports()
+    suid_binaries = get_suid_binaries(search_dirs=search_dirs)
+    permissions_issues = check_permissions_issues(paths=paths)
+    ssh_hygiene = check_ssh_hygiene(config_path=config_path) if config_path else check_ssh_hygiene()
+
+    gtfobins_count = sum(1 for b in suid_binaries if b.get("is_gtfobins"))
+    ssh_issues = ssh_hygiene.get("issues", []) if isinstance(ssh_hygiene, dict) else ssh_hygiene
+
+    summary = {
+        "listening_ports_count": len(listening_ports),
+        "total_ports": len(listening_ports),
+        "suid_binaries_count": len(suid_binaries),
+        "suid_count": len(suid_binaries),
+        "total_suids": len(suid_binaries),
+        "gtfobins_count": gtfobins_count,
+        "permissions_issues_count": len(permissions_issues),
+        "ssh_issues_count": len(ssh_issues),
+        "total_issues": gtfobins_count + len(permissions_issues) + len(ssh_issues),
+    }
+
+    return {
+        "system_info": sys_info,
+        "listening_ports": listening_ports,
+        "suid_binaries": suid_binaries,
+        "permissions_issues": permissions_issues,
+        "ssh_hygiene": ssh_hygiene,
+        "summary": summary,
+    }
+
+
+def print_host_human_report(report: dict) -> None:
+    """Print clean terminal output for host posture audit."""
+    sys_info = report.get("system_info", {})
+    listening_ports = report.get("listening_ports", [])
+    suid_binaries = report.get("suid_binaries", [])
+    perm_issues = report.get("permissions_issues", [])
+    ssh_hygiene = report.get("ssh_hygiene", {})
+
+    print("=== System Info ===")
+    print(f"Hostname:     {sys_info.get('hostname', 'unknown')}")
+    print(f"Platform:     {sys_info.get('platform', 'unknown')}")
+    print(f"Kernel:       {sys_info.get('kernel', 'unknown')}")
+    print(f"Current User: {sys_info.get('current_user', 'unknown')}")
+    print()
+
+    print("=== Listening Ports ===")
+    if listening_ports:
+        print(f"{'Proto':<7} {'Port':<8} {'Bind Address'}")
+        print("-" * 40)
+        for p in listening_ports:
+            print(f"{p['proto']:<7} {p['port']:<8} {p['bind_address']}")
+    else:
+        print("No active listening ports detected.")
+    print()
+
+    print("=== SUID Binaries ===")
+    if suid_binaries:
+        gtfo_list = [b for b in suid_binaries if b.get("is_gtfobins")]
+        non_gtfo = [b for b in suid_binaries if not b.get("is_gtfobins")]
+        print(f"Total SUID/SGID binaries found: {len(suid_binaries)} ({len(gtfo_list)} GTFOBins flagged)\n")
+        if gtfo_list:
+            print("Privilege Escalation Risks (GTFOBins):")
+            for b in gtfo_list:
+                print(f"  [{b['severity']}] {b['path']}")
+            print()
+        if non_gtfo:
+            print("Standard SUID/SGID Binaries:")
+            for b in non_gtfo:
+                print(f"  [{b['severity']}] {b['path']}")
+    else:
+        print("No SUID/SGID binaries detected.")
+    print()
+
+    print("=== Permissions ===")
+    if perm_issues:
+        for issue in perm_issues:
+            print(f"  [{issue.get('severity', 'CRITICAL')}] {issue.get('path')} - {issue.get('issue', 'Permission risk')} (mode: {issue.get('permissions', '')})")
+    else:
+        print("No sensitive file permission issues detected.")
+    print()
+
+    print("=== SSH Hygiene ===")
+    if isinstance(ssh_hygiene, dict):
+        cfg = ssh_hygiene.get("config_file", "/etc/ssh/sshd_config")
+        issues = ssh_hygiene.get("issues", [])
+        if not ssh_hygiene.get("accessible", False):
+            print(f"SSH config '{cfg}' not found or not readable.")
+        elif issues:
+            for issue in issues:
+                print(f"  [{issue['severity']}] Line {issue.get('line', '?')}: {issue['setting']}={issue['value']} - {issue['description']}")
+        else:
+            print(f"SSH config '{cfg}' checked - no high-risk hygiene issues detected.")
+    elif isinstance(ssh_hygiene, list) and ssh_hygiene:
+        for issue in ssh_hygiene:
+            print(f"  [{issue['severity']}] {issue['setting']}={issue['value']} - {issue['description']}")
+    else:
+        print("No SSH hygiene issues detected.")
+    print()
+
+    summary = report.get("summary", {})
+    print("=== Summary ===")
+    print(f"Listening Ports:      {summary.get('listening_ports_count', len(listening_ports))}")
+    print(f"SUID Binaries:        {summary.get('suid_binaries_count', len(suid_binaries))} ({summary.get('gtfobins_count', 0)} GTFOBins)")
+    print(f"Permissions Issues:   {summary.get('permissions_issues_count', len(perm_issues))}")
+    print(f"SSH Hygiene Issues:   {summary.get('ssh_issues_count', 0)}")
+    print(f"Total Actionable:     {summary.get('total_issues', 0)}")
+
+
+def handle_host(args) -> int:
+    """Handle host subcommand execution."""
+    report = audit_host()
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+    else:
+        print_host_human_report(report)
+
+    return 0
+
+
+# =============================================================================
+# Triage Subcommand (Web Access & Auth Log Forensics)
+# =============================================================================
+
+WEB_EXPLOIT_SIGNATURES = [
+    {
+        "signature": "COMMAND_INJECTION",
+        "severity": "CRITICAL",
+        "pattern": re.compile(
+            r"(?:/bin/sh|/bin/bash|cmd\.exe|powershell|;\s*id\b|;\s*whoami\b|\|\s*id\b|\|\s*whoami\b|`id`|`whoami`)",
+            re.IGNORECASE,
+        ),
+        "description": "Command injection probe",
+    },
+    {
+        "signature": "SQL_INJECTION",
+        "severity": "CRITICAL",
+        "pattern": re.compile(
+            r"(?:UNION\s+SELECT|\bSELECT\s+[^\&]+\s+FROM\b|OR\s+1=1|WAITFOR\s+DELAY)",
+            re.IGNORECASE,
+        ),
+        "description": "SQL injection probe",
+    },
+    {
+        "signature": "PATH_TRAVERSAL",
+        "severity": "HIGH",
+        "pattern": re.compile(
+            r"(?:\.\./|\.\.\\|%2e%2e/|%2e%2e\\|%2e%2e%2f|%2e%2e)",
+            re.IGNORECASE,
+        ),
+        "description": "Path traversal probe",
+    },
+    {
+        "signature": "SENSITIVE_FILES",
+        "severity": "HIGH",
+        "pattern": re.compile(
+            r"(?:\.env|\.git|\.svn|wp-config|\.htaccess|id_rsa|config\.json)",
+            re.IGNORECASE,
+        ),
+        "description": "Sensitive configuration or credential file probe",
+    },
+    {
+        "signature": "ADMIN_PANELS",
+        "severity": "MEDIUM",
+        "pattern": re.compile(
+            r"(?:wp-login|wp-admin|phpmyadmin|adminer|xmlrpc\.php)",
+            re.IGNORECASE,
+        ),
+        "description": "Administrative panel access probe",
+    },
+]
+
+WEB_REGEX_CLF = re.compile(
+    r'^(?:(?P<syslog_prefix>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\S+\s+[\w\-]+(?:\[\d+\])?:\s+))?'
+    r'(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<timestamp>[^\]]*)\]\s+"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+HTTP/[\d\.]+)?(?:")?\s+(?P<status>\d{3})(?:\s+(?P<size>\S+))?(?:\s+"(?P<referrer>[^"]*)"\s+"(?P<user_agent>[^"]*)")?'
+)
+
+WEB_REGEX_QUOTED = re.compile(
+    r'^(?:.*?\s+)?(?P<ip>\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+.*?"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+HTTP/[\d\.]+)?(?:")?\s+(?P<status>\d{3})(?:\s+(?P<size>\S+))?'
+)
+
+WEB_REGEX_GENERIC = re.compile(
+    r'^(?:.*?\s+)?(?P<ip>\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+(?:\[(?P<timestamp>[^\]]*)\]\s+)?(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+HTTP/[\d\.]+)?\s+(?P<status>\d{3})(?:\s+(?P<size>\S+))?'
+)
+
+AUTH_FAILED_PWD_RE = re.compile(
+    r"Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+)(?: port (?P<port>\d+))?",
+    re.IGNORECASE,
+)
+
+AUTH_ACCEPTED_RE = re.compile(
+    r"Accepted (?P<auth_method>password|publickey) for (?P<user>\S+) from (?P<ip>\S+)(?: port (?P<port>\d+))?",
+    re.IGNORECASE,
+)
+
+AUTH_SUDO_RE = re.compile(
+    r"sudo:\s*(?:(?P<user>\S+)\s*:\s*)?.*?(?:TTY=(?P<tty>\S+)\s*;\s*)?(?:PWD=(?P<pwd>\S+)\s*;\s*)?(?:USER=(?P<target_user>\S+)\s*;\s*)?COMMAND=(?P<cmd>.*)",
+    re.IGNORECASE,
+)
+
+AUTH_PAM_FAILURE_RE = re.compile(
+    r"authentication failure;.*?(?:rhost=(?P<ip>\S+))?.*?(?:\buser=|\blogname=)(?P<user>\S+)",
+    re.IGNORECASE,
+)
+
+SYSLOG_TS_RE = re.compile(r"^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}|[\d\-T:\.+Z]+)")
+
+
+def detect_log_type(logfile: str) -> str:
+    """Inspect the first lines of log file to auto-detect 'web' or 'auth' format."""
+    web_score = 0
+    auth_score = 0
+
+    web_indicators = re.compile(
+        r'(?:\"[A-Z]{3,7}\s+/[^\s"]*\s+HTTP/[\d\.]+\"|\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS)\s+/[^\s"]*\s+HTTP|\b\d{1,3}(?:\.\d{1,3}){3}\b.*?\b[1-5]\d{2}\b)',
+        re.IGNORECASE,
+    )
+    auth_indicators = re.compile(
+        r'(?:\bsshd\b|\bsudo\b|\bpam_unix\b|Failed password|Accepted password|Accepted publickey|authentication failure)',
+        re.IGNORECASE,
+    )
+
+    try:
+        with open(logfile, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 50:
+                    break
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                if web_indicators.search(line_str):
+                    web_score += 1
+                if auth_indicators.search(line_str):
+                    auth_score += 1
+    except Exception:
+        pass
+
+    if auth_score > web_score:
+        return "auth"
+    return "web"
+
+
+def parse_web_log_line(line: str) -> dict | None:
+    """Parse a single web log line into structured request components."""
+    line_str = line.strip()
+    if not line_str:
+        return None
+
+    m = WEB_REGEX_CLF.match(line_str)
+    if not m:
+        m = WEB_REGEX_QUOTED.match(line_str)
+    if not m:
+        m = WEB_REGEX_GENERIC.match(line_str)
+
+    if m:
+        gd = m.groupdict()
+        ip = gd.get("ip")
+        method = (gd.get("method") or "GET").upper()
+        path = gd.get("path") or "/"
+        status_str = gd.get("status")
+        status_code = int(status_str) if status_str and status_str.isdigit() else 200
+        timestamp = gd.get("timestamp") or ""
+        size_str = gd.get("size")
+        size = int(size_str) if size_str and size_str.isdigit() else 0
+        user_agent = gd.get("user_agent") or ""
+        referrer = gd.get("referrer") or ""
+        return {
+            "ip": ip,
+            "method": method,
+            "path": path,
+            "status_code": status_code,
+            "timestamp": timestamp,
+            "size": size,
+            "user_agent": user_agent,
+            "referrer": referrer,
+        }
+
+    # Fallback heuristic: search for IP, method, path, and status code
+    ip_m = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line_str)
+    req_m = re.search(r'"?([A-Z]{3,7})\s+(\S+)(?:\s+HTTP/[\d\.]+)?(?:")?\s+(\d{3})', line_str)
+    if ip_m and req_m:
+        return {
+            "ip": ip_m.group(0),
+            "method": req_m.group(1).upper(),
+            "path": req_m.group(2),
+            "status_code": int(req_m.group(3)),
+            "timestamp": "",
+            "size": 0,
+            "user_agent": "",
+            "referrer": "",
+        }
+    return None
+
+
+def triage_web_logs(logfile: str) -> dict:
+    """Perform security triage and forensics on web access logs."""
+    total_lines = 0
+    top_ips = Counter()
+    status_distribution = {
+        "2xx": 0,
+        "3xx": 0,
+        "4xx": 0,
+        "5xx": 0,
+    }
+    exploit_attempts = []
+
+    try:
+        with open(logfile, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                total_lines += 1
+                parsed = parse_web_log_line(line)
+                if not parsed:
+                    continue
+
+                ip = parsed["ip"]
+                method = parsed["method"]
+                path = parsed["path"]
+                status_code = parsed["status_code"]
+                timestamp = parsed["timestamp"]
+
+                top_ips[ip] += 1
+
+                # Update status distribution
+                if 200 <= status_code < 300:
+                    status_distribution["2xx"] += 1
+                elif 300 <= status_code < 400:
+                    status_distribution["3xx"] += 1
+                elif 400 <= status_code < 500:
+                    status_distribution["4xx"] += 1
+                elif 500 <= status_code < 600:
+                    status_distribution["5xx"] += 1
+
+                sc_str = str(status_code)
+                status_distribution[sc_str] = status_distribution.get(sc_str, 0) + 1
+
+                # Exploit probe analysis
+                unquoted_path = unquote(path)
+                matched_signatures = set()
+                for rule in WEB_EXPLOIT_SIGNATURES:
+                    sig = rule["signature"]
+                    if sig in matched_signatures:
+                        continue
+                    if rule["pattern"].search(path) or rule["pattern"].search(unquoted_path):
+                        matched_signatures.add(sig)
+                        exploit_attempts.append({
+                            "ip": ip,
+                            "method": method,
+                            "path": path,
+                            "status_code": status_code,
+                            "signature": sig,
+                            "severity": rule["severity"],
+                            "description": rule["description"],
+                            "timestamp": timestamp,
+                        })
+    except Exception as e:
+        sys.stderr.write(f"Warning: Error reading web log {logfile}: {e}\n")
+
+    summary = {
+        "total_lines": total_lines,
+        "total_requests": sum(top_ips.values()),
+        "unique_ips": len(top_ips),
+        "exploit_attempts_count": len(exploit_attempts),
+        "status_distribution": status_distribution,
+    }
+
+    return {
+        "logfile": logfile,
+        "log_type": "web",
+        "total_lines": total_lines,
+        "top_ips": dict(top_ips.most_common()),
+        "status_distribution": status_distribution,
+        "exploit_attempts": exploit_attempts,
+        "summary": summary,
+    }
+
+
+def triage_auth_logs(logfile: str) -> dict:
+    """Perform security triage and forensics on authentication/syslog logs."""
+    total_lines = 0
+    failed_logins = []
+    accepted_logins = []
+    sudo_commands = []
+    failed_ips = Counter()
+
+    try:
+        with open(logfile, "r", encoding="utf-8", errors="replace") as f:
+            for line_no, line in enumerate(f, start=1):
+                total_lines += 1
+                line_str = line.strip()
+                if not line_str:
+                    continue
+
+                ts_m = SYSLOG_TS_RE.match(line_str)
+                timestamp = ts_m.group(1) if ts_m else ""
+
+                # 1. SSH failed password
+                failed_m = AUTH_FAILED_PWD_RE.search(line_str)
+                if failed_m:
+                    user = failed_m.group("user")
+                    ip = failed_m.group("ip")
+                    port_str = failed_m.group("port")
+                    port = int(port_str) if port_str and port_str.isdigit() else None
+                    failed_logins.append({
+                        "line": line_no,
+                        "timestamp": timestamp,
+                        "user": user,
+                        "ip": ip,
+                        "port": port,
+                        "message": line_str,
+                    })
+                    failed_ips[ip] += 1
+                    continue
+
+                # PAM auth failure
+                pam_m = AUTH_PAM_FAILURE_RE.search(line_str)
+                if pam_m:
+                    user = pam_m.group("user")
+                    ip = pam_m.group("ip") or "unknown"
+                    failed_logins.append({
+                        "line": line_no,
+                        "timestamp": timestamp,
+                        "user": user,
+                        "ip": ip,
+                        "port": None,
+                        "message": line_str,
+                    })
+                    if ip != "unknown":
+                        failed_ips[ip] += 1
+                    continue
+
+                # 2. SSH accepted password or key
+                acc_m = AUTH_ACCEPTED_RE.search(line_str)
+                if acc_m:
+                    user = acc_m.group("user")
+                    ip = acc_m.group("ip")
+                    auth_method = acc_m.group("auth_method")
+                    port_str = acc_m.group("port")
+                    port = int(port_str) if port_str and port_str.isdigit() else None
+                    accepted_logins.append({
+                        "line": line_no,
+                        "timestamp": timestamp,
+                        "user": user,
+                        "ip": ip,
+                        "port": port,
+                        "auth_method": auth_method,
+                    })
+                    continue
+
+                # 3. Sudo command execution
+                sudo_m = AUTH_SUDO_RE.search(line_str)
+                if sudo_m:
+                    user = sudo_m.group("user") or "unknown"
+                    cmd = sudo_m.group("cmd").strip()
+                    target_user = sudo_m.group("target_user") or "root"
+                    pwd = sudo_m.group("pwd") or ""
+                    tty = sudo_m.group("tty") or ""
+                    sudo_commands.append({
+                        "line": line_no,
+                        "timestamp": timestamp,
+                        "user": user,
+                        "target_user": target_user,
+                        "pwd": pwd,
+                        "tty": tty,
+                        "command": cmd,
+                    })
+                    continue
+    except Exception as e:
+        sys.stderr.write(f"Warning: Error reading auth log {logfile}: {e}\n")
+
+    brute_force_ips = [ip for ip, count in failed_ips.items() if count >= 3]
+    brute_force_findings = [
+        {
+            "ip": ip,
+            "failed_attempts": count,
+            "signature": "BRUTE_FORCE",
+            "severity": "CRITICAL" if count >= 5 else "HIGH",
+            "description": f"Potential SSH brute-force attack from {ip} ({count} failed attempts)",
+        }
+        for ip, count in failed_ips.items() if count >= 3
+    ]
+
+    summary = {
+        "total_lines": total_lines,
+        "failed_logins_count": len(failed_logins),
+        "accepted_logins_count": len(accepted_logins),
+        "sudo_commands_count": len(sudo_commands),
+        "brute_force_ips_count": len(brute_force_ips),
+    }
+
+    return {
+        "logfile": logfile,
+        "log_type": "auth",
+        "total_lines": total_lines,
+        "failed_logins": failed_logins,
+        "accepted_logins": accepted_logins,
+        "sudo_commands": sudo_commands,
+        "brute_force_ips": brute_force_ips,
+        "brute_force_findings": brute_force_findings,
+        "summary": summary,
+    }
+
+
+def triage_logs(logfile: str, log_type: str = "auto") -> dict:
+    """Triage security logs (web access or authentication forensics)."""
+    if log_type == "auto":
+        resolved_type = detect_log_type(logfile)
+    else:
+        resolved_type = log_type
+
+    if resolved_type == "auth":
+        return triage_auth_logs(logfile)
+    else:
+        return triage_web_logs(logfile)
+
+
+def print_triage_human_report(report: dict) -> None:
+    """Print clean terminal output for triage forensic audit."""
+    logfile = report.get("logfile", "")
+    log_type = report.get("log_type", "unknown")
+    summary = report.get("summary", {})
+
+    if log_type == "web":
+        print(f"=== Web Access Log Forensics: {logfile} ===")
+        print(f"Total Requests:       {summary.get('total_requests', 0)}")
+        print(f"Unique IPs:           {summary.get('unique_ips', 0)}")
+        print(f"Exploit Attempts:     {summary.get('exploit_attempts_count', 0)}")
+        print()
+
+        print("=== Top Client IPs ===")
+        top_ips = report.get("top_ips", {})
+        if top_ips:
+            for ip, count in list(top_ips.items())[:10]:
+                print(f"  {ip:<20} {count:>6} requests")
+        else:
+            print("  No IP activity recorded.")
+        print()
+
+        print("=== Status Code Distribution ===")
+        status_dist = report.get("status_distribution", {})
+        for code_class in ["2xx", "3xx", "4xx", "5xx"]:
+            print(f"  {code_class}: {status_dist.get(code_class, 0)}")
+        print()
+
+        print("=== Exploit Attempts ===")
+        exploit_attempts = report.get("exploit_attempts", [])
+        if exploit_attempts:
+            for attempt in exploit_attempts:
+                print(
+                    f"  [{attempt.get('severity', 'HIGH')}] {attempt.get('signature')} | "
+                    f"{attempt.get('ip')} | {attempt.get('method')} {attempt.get('path')} "
+                    f"(HTTP {attempt.get('status_code')})"
+                )
+        else:
+            print("  No exploit attempts detected.")
+        print()
+
+    elif log_type == "auth":
+        print(f"=== Authentication Log Forensics: {logfile} ===")
+        print(f"Total Lines:          {summary.get('total_lines', 0)}")
+        print(f"Failed Logins:        {summary.get('failed_logins_count', 0)}")
+        print(f"Accepted Logins:      {summary.get('accepted_logins_count', 0)}")
+        print(f"Sudo Commands:        {summary.get('sudo_commands_count', 0)}")
+        print(f"Brute Force IPs:      {summary.get('brute_force_ips_count', 0)}")
+        print()
+
+        print("=== Brute Force Detections ===")
+        brute_force_ips = report.get("brute_force_ips", [])
+        if brute_force_ips:
+            for ip in brute_force_ips:
+                print(f"  [CRITICAL] BRUTE_FORCE detected from IP: {ip}")
+        else:
+            print("  No brute-force patterns detected.")
+        print()
+
+        print("=== Failed Logins ===")
+        failed_logins = report.get("failed_logins", [])
+        if failed_logins:
+            for fl in failed_logins[:15]:
+                print(f"  Line {fl.get('line')}: user '{fl.get('user')}' from {fl.get('ip')}")
+            if len(failed_logins) > 15:
+                print(f"  ... and {len(failed_logins) - 15} more failed login attempts")
+        else:
+            print("  No failed login attempts recorded.")
+        print()
+
+        print("=== Accepted Logins ===")
+        accepted_logins = report.get("accepted_logins", [])
+        if accepted_logins:
+            for al in accepted_logins[:10]:
+                print(f"  Line {al.get('line')}: user '{al.get('user')}' from {al.get('ip')} ({al.get('auth_method')})")
+        else:
+            print("  No accepted logins recorded.")
+        print()
+
+        print("=== Sudo Commands ===")
+        sudo_commands = report.get("sudo_commands", [])
+        if sudo_commands:
+            for sc in sudo_commands:
+                print(f"  Line {sc.get('line')}: {sc.get('user')} -> {sc.get('target_user')}: {sc.get('command')}")
+        else:
+            print("  No sudo executions recorded.")
+        print()
+
+
+def handle_triage(args) -> int:
+    """Handle triage subcommand execution."""
+    logfile = args.logfile
+    if not os.path.isfile(logfile):
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "logfile": logfile,
+                "error": f"Log file '{logfile}' not found or is not a regular file",
+            }, indent=2))
+        else:
+            sys.stderr.write(f"Error: Log file '{logfile}' does not exist or is not a regular file.\n")
+        return 1
+
+    log_type = getattr(args, "type", "auto")
+    report = triage_logs(logfile, log_type)
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+    else:
+        print_triage_human_report(report)
+
+    return 0
+
+
+# =============================================================================
+# PATCH RECIPE LIBRARY
+# =============================================================================
+
+PATCH_RECIPES = {
+    "safe-path": {
+        "recipe": "safe-path",
+        "title": "Hardened Path Traversal Defense",
+        "description": (
+            "Prevents directory traversal (../) attacks, absolute path escapes, and null-byte injection "
+            "by resolving canonical paths and strictly verifying directory containment."
+        ),
+        "python": '''import os
+from pathlib import Path
+
+
+def resolve_safe_path(base_dir: str | Path, untrusted_path: str) -> str:
+    """
+    Safely resolve and validate that untrusted_path stays strictly within base_dir.
+    Guards against directory traversal (../), absolute path overrides, and symlink escapes.
+    Raises ValueError if target path escapes base_dir.
+    """
+    # Canonicalize base directory
+    base = os.path.realpath(str(base_dir))
+
+    # Sanitize and join relative path (strip leading slashes to prevent root-relative override)
+    clean_untrusted = untrusted_path.lstrip("/\\\\")
+    target = os.path.realpath(os.path.join(base, clean_untrusted))
+
+    # Common path containment check
+    try:
+        common = os.path.commonpath([base, target])
+    except ValueError:
+        # Occurs on Windows if paths are on different drive letters
+        raise ValueError(f"Path traversal detected: {untrusted_path!r} escapes {base_dir!r}")
+
+    if common != base:
+        raise ValueError(f"Path traversal detected: {untrusted_path!r} escapes {base_dir!r}")
+
+    return target
+
+
+# Example usage:
+# safe_file = resolve_safe_path("/var/app/uploads", user_filename)
+# with open(safe_file, "rb") as f:
+#     data = f.read()
+''',
+        "typescript": '''import * as path from "node:path";
+
+/**
+ * Safely resolves and validates that an untrusted file path remains strictly
+ * confined within the designated base directory.
+ * Prevents directory traversal attacks (e.g. '../', absolute path escapes, null bytes).
+ */
+export function resolveSafePath(baseDir: string, untrustedPath: string): string {
+  // Reject null byte injection
+  if (untrustedPath.includes("\\0")) {
+    throw new Error("Invalid path: null byte detected");
+  }
+
+  // Resolve absolute canonical base directory
+  const resolvedBase = path.resolve(baseDir);
+
+  // Strip leading separators to prevent treating untrustedPath as an absolute path
+  const sanitizedInput = untrustedPath.replace(/^[\\/\\\\]+/, "");
+  const resolvedTarget = path.resolve(resolvedBase, sanitizedInput);
+
+  // Compute relative path from base to target
+  const relative = path.relative(resolvedBase, resolvedTarget);
+
+  // Check if relative path escapes base directory (starts with '..' or is root escape)
+  const isEscape = relative.startsWith("..") || path.isAbsolute(relative);
+  if (isEscape) {
+    throw new Error(`Path traversal detected: "${untrustedPath}" escapes "${baseDir}"`);
+  }
+
+  return resolvedTarget;
+}
+
+// Example usage:
+// const safePath = resolveSafePath("/var/app/uploads", req.params.filename);
+// const fileContent = await fs.promises.readFile(safePath);
+''',
+    },
+    "sql-param": {
+        "recipe": "sql-param",
+        "title": "Parameterized SQL Queries",
+        "description": (
+            "Mitigates SQL injection vulnerabilities across database engines by using parameterized queries "
+            "and prepared statements instead of dynamic string concatenation or template formatting."
+        ),
+        "python": '''# =============================================================================
+# 1. Python sqlite3 (placeholder style: '?')
+# =============================================================================
+import sqlite3
+
+
+def query_user_sqlite(db_path: str, user_id: int, status: str) -> dict | None:
+    """Safe parameterized query using standard sqlite3 placeholder '?'."""
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Parameterized query with ? placeholders
+        cursor.execute(
+            "SELECT id, username, email, status FROM users WHERE id = ? AND status = ?",
+            (user_id, status),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+# =============================================================================
+# 2. Python psycopg2 (PostgreSQL placeholder style: '%s')
+# =============================================================================
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+
+def query_user_postgres(conn_str: str, email: str, role: str) -> list[dict]:
+    """Safe parameterized query using psycopg2 placeholder '%s'."""
+    with psycopg2.connect(conn_str) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # psycopg2 uses %s for all datatypes (strings, ints, floats, dates)
+            # NEVER use Python % string formatting: execute(query % val) is vulnerable!
+            cursor.execute(
+                "SELECT id, username, email, role FROM users WHERE email = %s AND role = %s",
+                (email, role),
+            )
+            return cursor.fetchall()
+''',
+        "typescript": '''// =============================================================================
+// 1. better-sqlite3 (placeholder style: '?' or named '@name')
+// =============================================================================
+import Database from "better-sqlite3";
+
+export function queryUserBetterSqlite(dbPath: string, userId: number, role: string) {
+  const db = new Database(dbPath);
+  try {
+    // Prepared statement with parameterized '?' placeholders
+    const stmt = db.prepare("SELECT id, username, email FROM users WHERE id = ? AND role = ?");
+    return stmt.get(userId, role);
+  } finally {
+    db.close();
+  }
+}
+
+// =============================================================================
+// 2. pg / node-postgres (placeholder style: '$1', '$2', ...)
+// =============================================================================
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+export async function queryUserPg(email: string, accountStatus: string) {
+  // Use numbered parameterized query variables: $1, $2, etc.
+  const query = "SELECT id, username, email FROM users WHERE email = $1 AND status = $2";
+  const values = [email, accountStatus];
+
+  const client = await pool.connect();
+  try {
+    const res = await client.query(query, values);
+    return res.rows;
+  } finally {
+    client.release();
+  }
+}
+
+// =============================================================================
+// 3. mysql2 (placeholder style: '?')
+// =============================================================================
+import mysql from "mysql2/promise";
+
+export async function queryUserMysql(userId: number, minAccessLevel: number) {
+  const connection = await mysql.createConnection(process.env.MYSQL_URL || "");
+  try {
+    // Parameterized queries with prepared statements using '?'
+    const [rows] = await connection.execute(
+      "SELECT id, username, access_level FROM users WHERE id = ? AND access_level >= ?",
+      [userId, minAccessLevel]
+    );
+    return rows;
+  } finally {
+    await connection.end();
+  }
+}
+''',
+    },
+    "security-headers": {
+        "recipe": "security-headers",
+        "title": "Production HTTP Security Headers",
+        "description": (
+            "Hardens web applications against XSS, clickjacking, MIME-sniffing, and MITM attacks by enforcing "
+            "Strict-Transport-Security, Content-Security-Policy, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, "
+            "Referrer-Policy: strict-origin-when-cross-origin, and Permissions-Policy."
+        ),
+        "python": '''# =============================================================================
+# Production HTTP Security Headers Dictionary
+# =============================================================================
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+# =============================================================================
+# 1. FastAPI Middleware
+# =============================================================================
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        for header, value in SECURITY_HEADERS.items():
+            response.headers[header] = value
+        return response
+
+
+app = FastAPI()
+app.add_middleware(SecurityHeadersMiddleware)
+
+# =============================================================================
+# 2. Flask Middleware
+# =============================================================================
+from flask import Flask
+
+flask_app = Flask(__name__)
+
+
+@flask_app.after_request
+def apply_security_headers(response):
+    for header, value in SECURITY_HEADERS.items():
+        response.headers[header] = value
+    return response
+''',
+        "typescript": '''// =============================================================================
+// Production HTTP Security Headers Dictionary
+// =============================================================================
+export const SECURITY_HEADERS: Record<string, string> = {
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+};
+
+// =============================================================================
+// 1. Express Middleware
+// =============================================================================
+import express, { Request, Response, NextFunction } from "express";
+
+export function securityHeadersMiddleware(req: Request, res: Response, next: NextFunction): void {
+  for (const [header, value] of Object.entries(SECURITY_HEADERS)) {
+    res.setHeader(header, value);
+  }
+  next();
+}
+
+const app = express();
+app.use(securityHeadersMiddleware);
+
+// =============================================================================
+// 2. Fastify Hook / Plugin
+// =============================================================================
+import Fastify from "fastify";
+
+export async function fastifySecurityHeaders(fastify: ReturnType<typeof Fastify>) {
+  fastify.addHook("onSend", async (request, reply) => {
+    for (const [header, value] of Object.entries(SECURITY_HEADERS)) {
+      reply.header(header, value);
+    }
+  });
+}
+''',
+    },
+    "timing-safe": {
+        "recipe": "timing-safe",
+        "title": "Constant-Time Credential Comparison",
+        "description": (
+            "Mitigates side-channel timing attacks when validating sensitive credentials, cryptographic "
+            "hashes, API tokens, and HMAC signatures by using constant-time equality comparisons with buffer length checks."
+        ),
+        "python": '''import hashlib
+import hmac
+
+
+def safe_string_compare(val_a: str, val_b: str) -> bool:
+    """
+    Constant-time comparison for sensitive credentials (API tokens, passwords, MACs).
+    Guards against side-channel timing attacks.
+    Uses hmac.compare_digest and buffer length checks.
+    """
+    bytes_a = val_a.encode("utf-8")
+    bytes_b = val_b.encode("utf-8")
+
+    # Buffer length comparison
+    length_equal = len(bytes_a) == len(bytes_b)
+
+    # Hash to fixed 32-byte SHA-256 buffers to prevent timing leaks from length differences
+    hash_a = hashlib.sha256(bytes_a).digest()
+    hash_b = hashlib.sha256(bytes_b).digest()
+
+    digest_equal = hmac.compare_digest(hash_a, hash_b)
+    content_equal = hmac.compare_digest(bytes_a, bytes_b) if length_equal else False
+
+    return length_equal and digest_equal and content_equal
+
+
+# Example usage:
+# is_valid = safe_string_compare(received_api_token, expected_api_token)
+''',
+        "typescript": '''import * as crypto from "node:crypto";
+
+/**
+ * Constant-time string comparison for sensitive credentials (tokens, signatures, keys).
+ * crypto.timingSafeEqual requires buffers of identical length; unequal lengths throw RangeError.
+ * We hash both inputs to fixed 32-byte SHA-256 buffers to guarantee constant comparison time
+ * even across strings of disparate lengths.
+ */
+export function timingSafeEqualString(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf-8");
+  const bufB = Buffer.from(b, "utf-8");
+
+  // Buffer length check
+  const lengthMatch = bufA.length === bufB.length;
+
+  // Hash to fixed-length 32-byte buffers
+  const hashA = crypto.createHash("sha256").update(bufA).digest();
+  const hashB = crypto.createHash("sha256").update(bufB).digest();
+
+  const hashMatch = crypto.timingSafeEqual(hashA, hashB);
+
+  // Direct buffer comparison if lengths match
+  const contentMatch = lengthMatch ? crypto.timingSafeEqual(bufA, bufB) : false;
+
+  return lengthMatch && hashMatch && contentMatch;
+}
+
+// Example usage:
+// if (!timingSafeEqualString(authHeader, API_SECRET)) {
+//   return res.status(401).send("Unauthorized");
+// }
+''',
+    },
+    "rate-limiter": {
+        "recipe": "rate-limiter",
+        "title": "Sliding Window Rate Limiter",
+        "description": (
+            "Guards endpoints against brute-force attacks, credential stuffing, and DoS abuse using a thread-safe "
+            "sliding window in-memory rate limiter based on request timestamps."
+        ),
+        "python": '''import collections
+import threading
+import time
+
+
+class SlidingWindowRateLimiter:
+    """
+    Thread-safe in-memory sliding window rate limiter using time.time().
+    Maintains a rolling window of request timestamps per key (e.g. IP address or user ID).
+    """
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests: dict[str, collections.deque[float]] = collections.defaultdict(collections.deque)
+        self.lock = threading.Lock()
+
+    def is_allowed(self, key: str) -> tuple[bool, dict]:
+        """
+        Check if request under key is allowed.
+        Returns (allowed: bool, stats: dict) with remaining count and retry_after.
+        """
+        now = time.time()
+        window_start = now - self.window_seconds
+
+        with self.lock:
+            timestamps = self.requests[key]
+
+            # Purge timestamps outside the active rolling window
+            while timestamps and timestamps[0] <= window_start:
+                timestamps.popleft()
+
+            count = len(timestamps)
+            if count < self.max_requests:
+                timestamps.append(now)
+                remaining = self.max_requests - len(timestamps)
+                return True, {
+                    "allowed": True,
+                    "remaining": remaining,
+                    "limit": self.max_requests,
+                    "retry_after": 0,
+                }
+            else:
+                oldest = timestamps[0]
+                retry_after = max(0.0, (oldest + self.window_seconds) - now)
+                return False, {
+                    "allowed": False,
+                    "remaining": 0,
+                    "limit": self.max_requests,
+                    "retry_after": round(retry_after, 2),
+                }
+
+    def cleanup(self) -> None:
+        """Prune idle keys older than the sliding window."""
+        now = time.time()
+        window_start = now - self.window_seconds
+        with self.lock:
+            idle_keys = [k for k, q in self.requests.items() if not q or q[-1] <= window_start]
+            for k in idle_keys:
+                del self.requests[k]
+
+
+# Example usage:
+# limiter = SlidingWindowRateLimiter(max_requests=100, window_seconds=60)
+# allowed, info = limiter.is_allowed(request.client_ip)
+# if not allowed:
+#     return Response(f"Rate limit exceeded. Retry after {info['retry_after']}s", status_code=429)
+''',
+        "typescript": '''interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  limit: number;
+  retryAfterSeconds: number;
+}
+
+/**
+ * In-memory sliding window rate limiter using Date.now().
+ * Tracks timestamps within rolling window per client identifier (IP, user token, etc.).
+ */
+export class SlidingWindowRateLimiter {
+  private readonly maxRequests: number;
+  private readonly windowMs: number;
+  private readonly requests: Map<string, number[]> = new Map();
+
+  constructor(maxRequests: number, windowSeconds: number) {
+    this.maxRequests = maxRequests;
+    this.windowMs = windowSeconds * 1000;
+  }
+
+  public isAllowed(key: string): RateLimitResult {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+
+    let timestamps = this.requests.get(key);
+    if (!timestamps) {
+      timestamps = [];
+      this.requests.set(key, timestamps);
+    }
+
+    // Filter out timestamps outside current rolling window
+    const activeTimestamps = timestamps.filter((t) => t > windowStart);
+    this.requests.set(key, activeTimestamps);
+
+    if (activeTimestamps.length < this.maxRequests) {
+      activeTimestamps.push(now);
+      return {
+        allowed: true,
+        remaining: this.maxRequests - activeTimestamps.length,
+        limit: this.maxRequests,
+        retryAfterSeconds: 0,
+      };
+    }
+
+    const oldest = activeTimestamps[0];
+    const retryAfterSeconds = Math.ceil(((oldest + this.windowMs) - now) / 1000);
+
+    return {
+      allowed: false,
+      remaining: 0,
+      limit: this.maxRequests,
+      retryAfterSeconds: Math.max(0, retryAfterSeconds),
+    };
+  }
+
+  public cleanup(): void {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    for (const [key, timestamps] of this.requests.entries()) {
+      const active = timestamps.filter((t) => t > windowStart);
+      if (active.length === 0) {
+        this.requests.delete(key);
+      } else {
+        this.requests.set(key, active);
+      }
+    }
+  }
+}
+
+// Example Express middleware:
+// const limiter = new SlidingWindowRateLimiter(60, 60); // 60 req/min
+// export function rateLimitMiddleware(req: Request, res: Response, next: NextFunction) {
+//   const ip = req.ip || req.socket.remoteAddress || "anonymous";
+//   const result = limiter.isAllowed(ip);
+//   res.setHeader("X-RateLimit-Limit", result.limit);
+//   res.setHeader("X-RateLimit-Remaining", result.remaining);
+//   if (!result.allowed) {
+//     res.setHeader("Retry-After", result.retryAfterSeconds);
+//     return res.status(429).json({ error: "Too Many Requests", retryAfter: result.retryAfterSeconds });
+//   }
+//   next();
+// }
+''',
+    },
+}
+
+
+def output_patch_recipe(recipe: str, as_json: bool) -> int:
+    """Output hardened defensive security recipe in structured JSON or human-readable format."""
+    recipe_data = PATCH_RECIPES.get(recipe)
+    if not recipe_data:
+        sys.stderr.write(f"Error: Unknown patch recipe '{recipe}'.\n")
+        return 1
+
+    if as_json:
+        print(json.dumps(recipe_data, indent=2))
+    else:
+        print("=" * 80)
+        print(f"Recipe: {recipe_data['title']} ({recipe_data['recipe']})")
+        print("=" * 80)
+        print("Description:")
+        print(recipe_data["description"])
+        print()
+        print("--- Python Implementation ---")
+        print(recipe_data["python"].strip())
+        print()
+        print("--- TypeScript Implementation ---")
+        print(recipe_data["typescript"].strip())
+        print()
+
+    return 0
+
+
+def handle_patch(args) -> int:
+    """Handle patch subcommand execution."""
+    recipe = args.recipe
+    as_json = getattr(args, "json", False)
+    return output_patch_recipe(recipe, as_json)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build and configure the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="cybersec",
+        description="Zero-dependency cybersecurity CLI engine for scanning, dependency auditing, host analysis, triage, and remediation.",
+    )
+
+    subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+
+    # scan subparser: path (positional), --json (flag), --deep (flag)
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="Run vulnerability, secret, and security policy scans",
+    )
+    scan_parser.add_argument(
+        "path",
+        help="Target file or directory path to scan",
+    )
+    scan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output findings as JSON",
+    )
+    scan_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Enable deep heuristic analysis",
+    )
+
+    # deps subparser: manifest (positional), --json (flag)
+    deps_parser = subparsers.add_parser(
+        "deps",
+        help="Audit software dependencies and package manifests for known vulnerabilities",
+    )
+    deps_parser.add_argument(
+        "manifest",
+        help="Path to manifest file (package.json, requirements.txt, etc.)",
+    )
+    deps_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output dependency audit findings as JSON",
+    )
+
+    # host subparser: --json (flag)
+    host_parser = subparsers.add_parser(
+        "host",
+        help="Audit host configuration, open ports, permissions, and attack surface",
+    )
+    host_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output host audit findings as JSON",
+    )
+
+    # triage subparser: logfile (positional), --type (choices=["auto", "web", "auth"], default="auto"), --json (flag)
+    triage_parser = subparsers.add_parser(
+        "triage",
+        help="Triage security findings, assess exploitability, and prioritize remediation",
+    )
+    triage_parser.add_argument(
+        "logfile",
+        help="Path to log file to inspect and triage",
+    )
+    triage_parser.add_argument(
+        "--type",
+        choices=["auto", "web", "auth"],
+        default="auto",
+        help="Log type format parser (default: auto)",
+    )
+    triage_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output triage report as JSON",
+    )
+
+    # patch subparser: recipe (positional, choices=["safe-path", "sql-param", "security-headers", "timing-safe", "rate-limiter"])
+    patch_parser = subparsers.add_parser(
+        "patch",
+        help="Generate or apply security patches, configuration fixes, and remediations",
+    )
+    patch_parser.add_argument(
+        "recipe",
+        choices=[
+            "safe-path",
+            "sql-param",
+            "security-headers",
+            "timing-safe",
+            "rate-limiter",
+        ],
+        help="Security remediation recipe to apply or inspect",
+    )
+    patch_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output patch recipe as JSON",
+    )
+
+    return parser
+
+
+def main(argv=None) -> int:
+    """Main entrypoint for cybersec CLI."""
+    parser = build_parser()
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args(argv)
+
+    if not args.subcommand:
+        parser.print_help()
+        return 0
+
+    if args.subcommand == "scan":
+        return handle_scan(args)
+
+    if args.subcommand == "deps":
+        return handle_deps(args)
+
+    if args.subcommand == "host":
+        return handle_host(args)
+
+    if args.subcommand == "triage":
+        return handle_triage(args)
+
+    if args.subcommand == "patch":
+        return handle_patch(args)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

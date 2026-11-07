@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+agent-eval: Zero-dependency AI Agent Benchmark, Evaluation, and Regression Testing CLI.
+
+Designed for measuring tool-calling accuracy, parameter alignment, hallucination rates,
+token costs across providers (Gemini, Claude, OpenAI), and comparing benchmark runs for regressions.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+# Standard Pricing per 1M tokens (USD)
+# [Input, Output, Cache-Read]
+MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    # Gemini
+    "gemini-2.5-flash": {"input": 0.075, "output": 0.30, "cache": 0.01875},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.00, "cache": 0.3125},
+    "gemini-3.8-flash": {"input": 0.075, "output": 0.30, "cache": 0.01875},
+    # Claude
+    "claude-3-5-haiku": {"input": 0.80, "output": 4.00, "cache": 0.08},
+    "claude-3-7-sonnet": {"input": 3.00, "output": 15.00, "cache": 0.30},
+    "claude-3-opus": {"input": 15.00, "output": 75.00, "cache": 1.50},
+    # OpenAI
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache": 0.075},
+    "gpt-4o": {"input": 2.50, "output": 10.00, "cache": 1.25},
+    "o3-mini": {"input": 1.10, "output": 4.40, "cache": 0.55},
+}
+
+
+def calculate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_tokens: int = 0,
+) -> Dict[str, Any]:
+    """Calculate token cost for a specified model."""
+    pricing = MODEL_PRICING.get(model.lower())
+    if not pricing:
+        # Search for prefix match
+        for k, v in MODEL_PRICING.items():
+            if k in model.lower() or model.lower() in k:
+                pricing = v
+                break
+
+    if not pricing:
+        pricing = {"input": 1.0, "output": 3.0, "cache": 0.25}
+
+    input_cost = (prompt_tokens / 1_000_000.0) * pricing["input"]
+    output_cost = (completion_tokens / 1_000_000.0) * pricing["output"]
+    cache_cost = (cache_tokens / 1_000_000.0) * pricing["cache"]
+    total_cost = input_cost + output_cost + cache_cost
+
+    return {
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cache_tokens": cache_tokens,
+        "total_tokens": prompt_tokens + completion_tokens + cache_tokens,
+        "input_cost_usd": round(input_cost, 6),
+        "output_cost_usd": round(output_cost, 6),
+        "cache_cost_usd": round(cache_cost, 6),
+        "total_cost_usd": round(total_cost, 6),
+    }
+
+
+def grade_case(expected: Dict[str, Any], actual: Dict[str, Any]) -> Dict[str, Any]:
+    """Grade a single agent tool-call execution against expected ground truth."""
+    case_id = expected.get("id", "case")
+    expected_tool = expected.get("expected_tool")
+    actual_tool = actual.get("tool")
+
+    # 1. Tool selection check
+    tool_match = (expected_tool == actual_tool)
+
+    # 2. Argument match check
+    expected_args = expected.get("expected_args", {})
+    actual_args = actual.get("args", {})
+
+    total_keys = len(expected_args)
+    matched_keys = 0
+    param_errors = []
+
+    for k, v in expected_args.items():
+        if k not in actual_args:
+            param_errors.append(f"Missing parameter '{k}'")
+        elif actual_args[k] == v or (isinstance(v, str) and v in str(actual_args[k])):
+            matched_keys += 1
+        else:
+            param_errors.append(f"Mismatch for '{k}': expected '{v}', got '{actual_args[k]}'")
+
+    # Extra parameters (potential hallucination)
+    extra_keys = [k for k in actual_args if k not in expected_args]
+    if extra_keys:
+        param_errors.append(f"Hallucinated extra parameters: {extra_keys}")
+
+    arg_accuracy = (matched_keys / total_keys) if total_keys > 0 else (1.0 if not actual_args else 0.0)
+
+    # Overall pass
+    passed = tool_match and (arg_accuracy >= 0.99) and (len(extra_keys) == 0)
+
+    return {
+        "id": case_id,
+        "passed": passed,
+        "tool_match": tool_match,
+        "expected_tool": expected_tool,
+        "actual_tool": actual_tool,
+        "arg_accuracy": round(arg_accuracy, 2),
+        "errors": param_errors,
+        "latency_ms": actual.get("latency_ms", 0),
+    }
+
+
+def run_grade(args: argparse.Namespace) -> int:
+    """Grade actual agent responses against an expected ground-truth dataset."""
+    ground_truth_path = args.ground_truth
+    results_path = args.results
+
+    if not os.path.exists(ground_truth_path):
+        sys.stderr.write(f"Error: Ground truth file '{ground_truth_path}' does not exist.\n")
+        return 1
+    if not os.path.exists(results_path):
+        sys.stderr.write(f"Error: Results file '{results_path}' does not exist.\n")
+        return 1
+
+    try:
+        with open(ground_truth_path, "r", encoding="utf-8") as f:
+            gt_data = json.load(f)
+        with open(results_path, "r", encoding="utf-8") as f:
+            res_data = json.load(f)
+    except Exception as e:
+        sys.stderr.write(f"Error parsing dataset JSON: {e}\n")
+        return 1
+
+    gt_map = {item.get("id", str(i)): item for i, item in enumerate(gt_data)}
+    res_map = {item.get("id", str(i)): item for i, item in enumerate(res_data)}
+
+    graded_cases: List[Dict[str, Any]] = []
+    passed_count = 0
+    tool_matches = 0
+
+    for cid, gt in gt_map.items():
+        actual = res_map.get(cid, {"tool": None, "args": {}, "latency_ms": 0})
+        g = grade_case(gt, actual)
+        graded_cases.append(g)
+        if g["passed"]:
+            passed_count += 1
+        if g["tool_match"]:
+            tool_matches += 1
+
+    total = len(graded_cases)
+    accuracy = (passed_count / total * 100.0) if total > 0 else 0.0
+    tool_acc = (tool_matches / total * 100.0) if total > 0 else 0.0
+
+    summary = {
+        "total_cases": total,
+        "passed_count": passed_count,
+        "failed_count": total - passed_count,
+        "pass_rate_percent": round(accuracy, 1),
+        "tool_selection_accuracy_percent": round(tool_acc, 1),
+        "cases": graded_cases,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"=== Agent Evaluation Results ===")
+        print(f"Total Cases:     {total}")
+        print(f"Pass Rate:       {summary['pass_rate_percent']}% ({passed_count}/{total} passed)")
+        print(f"Tool Selection:  {summary['tool_selection_accuracy_percent']}%")
+        print("\nCase Details:")
+        for c in graded_cases:
+            mark = "✓" if c["passed"] else "✗"
+            print(f"  [{mark}] {c['id']}: Tool='{c['actual_tool']}' (Expected: '{c['expected_tool']}')")
+            if c["errors"]:
+                for err in c["errors"]:
+                    print(f"      - {err}")
+
+    return 0 if (accuracy >= float(args.min_pass_rate)) else 2
+
+
+def run_cost(args: argparse.Namespace) -> int:
+    """Calculate token cost for given model and token counts."""
+    cost_info = calculate_cost(
+        args.model,
+        args.prompt_tokens,
+        args.completion_tokens,
+        args.cache_tokens or 0,
+    )
+
+    if args.json:
+        print(json.dumps(cost_info, indent=2))
+    else:
+        print(f"=== Token Cost Calculation: {cost_info['model']} ===")
+        print(f"Prompt Tokens:     {cost_info['prompt_tokens']:,}")
+        print(f"Completion Tokens: {cost_info['completion_tokens']:,}")
+        print(f"Cache Read Tokens: {cost_info['cache_tokens']:,}")
+        print(f"Total Tokens:      {cost_info['total_tokens']:,}")
+        print("-" * 40)
+        print(f"Input Cost:        ${cost_info['input_cost_usd']:.6f}")
+        print(f"Output Cost:       ${cost_info['output_cost_usd']:.6f}")
+        print(f"Cache Cost:        ${cost_info['cache_cost_usd']:.6f}")
+        print(f"Total Cost:        ${cost_info['total_cost_usd']:.6f} USD")
+
+    return 0
+
+
+def run_regression(args: argparse.Namespace) -> int:
+    """Compare baseline run with current run to identify regressions."""
+    if not os.path.exists(args.baseline):
+        sys.stderr.write(f"Error: Baseline file '{args.baseline}' does not exist.\n")
+        return 1
+    if not os.path.exists(args.current):
+        sys.stderr.write(f"Error: Current run file '{args.current}' does not exist.\n")
+        return 1
+
+    try:
+        with open(args.baseline, "r", encoding="utf-8") as f:
+            base_data = json.load(f)
+        with open(args.current, "r", encoding="utf-8") as f:
+            curr_data = json.load(f)
+    except Exception as e:
+        sys.stderr.write(f"Error parsing JSON: {e}\n")
+        return 1
+
+    base_cases = {c.get("id"): c for c in base_data.get("cases", base_data)}
+    curr_cases = {c.get("id"): c for c in curr_data.get("cases", curr_data)}
+
+    regressions: List[Dict[str, Any]] = []
+    improvements: List[Dict[str, Any]] = []
+
+    for cid, b_case in base_cases.items():
+        if cid in curr_cases:
+            c_case = curr_cases[cid]
+            b_passed = b_case.get("passed", False)
+            c_passed = c_case.get("passed", False)
+
+            if b_passed and not c_passed:
+                regressions.append({
+                    "id": cid,
+                    "type": "ACCURACY_REGRESSION",
+                    "description": f"Test case '{cid}' passed in baseline but failed in current run.",
+                    "errors": c_case.get("errors", []),
+                })
+            elif not b_passed and c_passed:
+                improvements.append({
+                    "id": cid,
+                    "type": "IMPROVEMENT",
+                    "description": f"Test case '{cid}' failed in baseline but passes in current run.",
+                })
+
+    result = {
+        "baseline_file": args.baseline,
+        "current_file": args.current,
+        "total_compared": len(base_cases),
+        "regressions_count": len(regressions),
+        "improvements_count": len(improvements),
+        "has_regressions": len(regressions) > 0,
+        "regressions": regressions,
+        "improvements": improvements,
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"=== Regression Comparison ===")
+        print(f"Total Compared: {result['total_compared']}")
+        print(f"Regressions:    {result['regressions_count']}")
+        print(f"Improvements:   {result['improvements_count']}")
+        if regressions:
+            print("\n[WARNING] Regressions Detected:")
+            for r in regressions:
+                print(f"  - {r['id']}: {r['description']}")
+        else:
+            print("\n[OK] No accuracy regressions found.")
+
+    return 2 if regressions else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent-eval",
+        description="Zero-dependency AI Agent benchmark, evaluation, and regression testing CLI.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+
+    # grade
+    p_grade = subparsers.add_parser("grade", help="Grade actual tool calls against ground truth")
+    p_grade.add_argument("ground_truth", help="Path to ground truth JSON dataset")
+    p_grade.add_argument("results", help="Path to actual test execution results JSON")
+    p_grade.add_argument("--min-pass-rate", type=float, default=0.0, help="Minimum pass rate percentage required to exit 0")
+    p_grade.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # cost
+    p_cost = subparsers.add_parser("cost", help="Calculate token cost across LLM models")
+    p_cost.add_argument("--model", "-m", required=True, help="Model name (e.g. gemini-2.5-flash, claude-3-7-sonnet, gpt-4o)")
+    p_cost.add_argument("--prompt-tokens", "-p", type=int, required=True, help="Number of prompt/input tokens")
+    p_cost.add_argument("--completion-tokens", "-c", type=int, required=True, help="Number of completion/output tokens")
+    p_cost.add_argument("--cache-tokens", type=int, default=0, help="Number of cached tokens read")
+    p_cost.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    # regression
+    p_reg = subparsers.add_parser("regression", help="Compare baseline run to current run for regressions")
+    p_reg.add_argument("baseline", help="Path to baseline evaluation JSON")
+    p_reg.add_argument("current", help="Path to current evaluation JSON")
+    p_reg.add_argument("--json", action="store_true", help="Output results in JSON format")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args()
+
+    if args.subcommand == "grade":
+        return run_grade(args)
+    elif args.subcommand == "cost":
+        return run_cost(args)
+    elif args.subcommand == "regression":
+        return run_regression(args)
+    else:
+        parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
