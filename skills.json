@@ -1,0 +1,18 @@
+{
+  "name": "aery-skills",
+  "version": "1.0.0",
+  "description": "Official on-demand skill registry for Aery agent",
+  "repository": "https://github.com/eminent337/aery-skills",
+  "skills": [
+    {
+      "name": "ai-humanizer",
+      "version": "1.2.0",
+      "description": "Zero-dependency AI detection forensic auditor and humanization engine to measure burstiness, purge AI markers, and evade detectors like Scribbr and Turnitin.",
+      "category": "Writing & Forensics",
+      "author": "eminent337",
+      "path": "skills/ai-humanizer",
+      "entry": "SKILL.md",
+      "scripts": ["scripts/ai-humanizer"]
+    }
+  ]
+}
