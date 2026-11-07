@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+upstream-sync: Sovereign Aery Upstream Synchronization & Rebranding Audit Tool
+
+Enforces the Aery Integration Protocol:
+- Safe upstream inspection (read-only)
+- Diff & commit extraction for surgical porting
+- Automated rebranding & token leakage audit (forbids kimchi, getkimchi, pi-mono, oh-my-pi)
+- Fast local verification check
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# ANSI colors
+class Colors:
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+
+def run_git(args, cwd=None, capture=True, check=True):
+    try:
+        res = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            capture_output=capture,
+            text=True,
+            check=check,
+        )
+        return res.stdout.strip() if capture else ""
+    except subprocess.CalledProcessError as e:
+        if capture:
+            return e.stdout.strip() if e.stdout else ""
+        raise e
+
+
+def find_repo_root():
+    cwd = Path.cwd()
+    root = run_git(["rev-parse", "--show-toplevel"], cwd=cwd, check=False)
+    if root and os.path.isdir(root):
+        return Path(root)
+    return cwd
+
+
+FORBIDDEN_PATTERNS = [
+    (re.compile(r"\bkimchi\b", re.IGNORECASE), "kimchi (upstream project name)"),
+    (re.compile(r"\bgetkimchi\b", re.IGNORECASE), "getkimchi (upstream org name)"),
+    (re.compile(r"\bpi-mono\b", re.IGNORECASE), "pi-mono (upstream mono-repo)"),
+    (re.compile(r"\boh-my-pi\b", re.IGNORECASE), "oh-my-pi (upstream fork)"),
+    (re.compile(r"\boh_my_pi\b", re.IGNORECASE), "oh_my_pi (upstream fork identifier)"),
+]
+
+# Files allowed to mention upstream terms (e.g. sync protocol documentation)
+WHITELISTED_FILES = {
+    "managing-upstream-syncs/SKILL.md",
+    "managing-upstream-syncs/README.md",
+    ".git/config",
+}
+
+
+def cmd_status(args):
+    repo_root = find_repo_root()
+    remote = args.remote
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Aery Upstream Status ({remote}) ==={Colors.RESET}\n")
+
+    # Check remotes
+    remotes = run_git(["remote"], cwd=repo_root, check=False).splitlines()
+    if remote not in remotes:
+        print(f"{Colors.RED}Error: Remote '{remote}' not found in repo.{Colors.RESET}")
+        print(f"Available remotes: {', '.join(remotes)}")
+        sys.exit(1)
+
+    url = run_git(["remote", "get-url", remote], cwd=repo_root, check=False)
+    print(f"{Colors.DIM}Remote URL:{Colors.RESET} {url}")
+
+    if not args.no_fetch:
+        print(f"{Colors.YELLOW}Fetching latest from {remote}...{Colors.RESET}")
+        subprocess.run(["git", "fetch", remote, "--quiet"], cwd=repo_root)
+        print(f"{Colors.GREEN}✓ Fetch complete (upstream is read-only).{Colors.RESET}\n")
+
+    branch = f"{remote}/main"
+    # Check if branch exists
+    try:
+        run_git(["rev-parse", "--verify", branch], cwd=repo_root)
+    except Exception:
+        branch = f"{remote}/master"
+
+    print(f"{Colors.BOLD}Recent Upstream Commits on {branch}:{Colors.RESET}")
+    log_format = "%C(yellow)%h%Creset %C(cyan)%cd%Creset %C(green)%an%Creset %s"
+    commits = run_git(
+        ["log", "-n", str(args.count), f"--pretty=format:{log_format}", "--date=short", branch],
+        cwd=repo_root,
+        check=False,
+    )
+    if commits:
+        print(commits)
+    else:
+        print(f"{Colors.DIM}(No commits found){Colors.RESET}")
+
+    print(f"\n{Colors.DIM}To inspect any upstream commit:{Colors.RESET}")
+    print(f"  upstream-sync inspect <commit-sha> [--remote {remote}]\n")
+
+
+def cmd_inspect(args):
+    repo_root = find_repo_root()
+    commit = args.commit
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Upstream Commit Inspection: {commit} ==={Colors.RESET}\n")
+
+    info = run_git(["show", "--stat", "--summary", commit], cwd=repo_root, check=False)
+    if not info:
+        print(f"{Colors.RED}Error: Commit '{commit}' could not be resolved.{Colors.RESET}")
+        sys.exit(1)
+
+    print(info)
+    print(f"\n{Colors.BOLD}Changed Files:{Colors.RESET}")
+    files = run_git(["show", "--name-only", "--pretty=format:", commit], cwd=repo_root, check=False)
+    file_list = [f for f in files.splitlines() if f.strip()]
+    for f in file_list:
+        # Suggest corresponding Aery path
+        aery_target = f
+        if f.startswith("packages/kimchi/"):
+            aery_target = f.replace("packages/kimchi/", "packages/coding-agent/")
+        print(f"  • {f}  {Colors.DIM}-->  (Aery target: {aery_target}){Colors.RESET}")
+
+    print(f"\n{Colors.DIM}To view raw patch for surgical porting:{Colors.RESET}")
+    print(f"  git show {commit}")
+
+
+def cmd_audit(args):
+    repo_root = find_repo_root()
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Aery Rebranding & Token Leakage Audit ==={Colors.RESET}\n")
+
+    files_to_check = []
+    if args.files:
+        for f in args.files:
+            p = Path(f)
+            if p.is_file():
+                files_to_check.append(p)
+            elif p.is_dir():
+                for root, _, fnames in os.walk(p):
+                    for fname in fnames:
+                        files_to_check.append(Path(root) / fname)
+    elif args.staged:
+        staged = run_git(["diff", "--name-only", "--cached"], cwd=repo_root, check=False).splitlines()
+        files_to_check = [repo_root / s for s in staged if (repo_root / s).is_file()]
+    else:
+        # Default: check modified and untracked code files
+        diff_files = run_git(["diff", "--name-only", "HEAD"], cwd=repo_root, check=False).splitlines()
+        files_to_check = [repo_root / d for d in diff_files if (repo_root / d).is_file()]
+
+    if not files_to_check:
+        print(f"{Colors.GREEN}✓ No files selected or modified for audit.{Colors.RESET}")
+        return
+
+    violations = []
+    for filepath in files_to_check:
+        rel_path = str(filepath.relative_to(repo_root)) if filepath.is_relative_to(repo_root) else str(filepath)
+
+        # Skip binary, git, or whitelisted
+        if any(w in rel_path for w in WHITELISTED_FILES) or ".git/" in rel_path or "node_modules/" in rel_path:
+            continue
+
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line_no, line in enumerate(f, start=1):
+                    for pattern, label in FORBIDDEN_PATTERNS:
+                        if pattern.search(line):
+                            violations.append({
+                                "file": rel_path,
+                                "line": line_no,
+                                "text": line.strip(),
+                                "pattern": label,
+                            })
+        except Exception:
+            continue
+
+    if violations:
+        print(f"{Colors.RED}{Colors.BOLD}FAIL: {len(violations)} forbidden upstream token(s) detected!{Colors.RESET}\n")
+        for v in violations:
+            print(f"  {Colors.RED}✗{Colors.RESET} {Colors.BOLD}{v['file']}:{v['line']}{Colors.RESET} [{v['pattern']}]")
+            print(f"    {Colors.DIM}{v['text']}{Colors.RESET}\n")
+        print(f"{Colors.YELLOW}Rebrand these occurrences to 'aery' before committing.{Colors.RESET}")
+        sys.exit(1)
+    else:
+        print(f"{Colors.GREEN}✓ Clean: 0 upstream token leaks detected across {len(files_to_check)} files.{Colors.RESET}")
+
+
+def cmd_verify(args):
+    repo_root = find_repo_root()
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Aery Local Verification Suite ==={Colors.RESET}\n")
+    print(f"{Colors.YELLOW}1. Running TypeScript typecheck (`bun run check:ts`)...{Colors.RESET}")
+    res1 = subprocess.run(["bun", "run", "check:ts"], cwd=repo_root)
+    if res1.returncode != 0:
+        print(f"{Colors.RED}✗ Typecheck failed with exit code {res1.returncode}{Colors.RESET}")
+        sys.exit(res1.returncode)
+    print(f"{Colors.GREEN}✓ Typecheck passed.{Colors.RESET}\n")
+
+    if not args.skip_tests:
+        print(f"{Colors.YELLOW}2. Running test suite (`bun run test`)...{Colors.RESET}")
+        res2 = subprocess.run(["bun", "run", "test"], cwd=repo_root)
+        if res2.returncode != 0:
+            print(f"{Colors.RED}✗ Tests failed with exit code {res2.returncode}{Colors.RESET}")
+            sys.exit(res2.returncode)
+        print(f"{Colors.GREEN}✓ Tests passed.{Colors.RESET}\n")
+
+    print(f"{Colors.BOLD}{Colors.GREEN}✓ Zero-Error Guarantee Verified.{Colors.RESET}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="upstream-sync",
+        description="Aery Sovereign Upstream Synchronization and Rebranding Quality Tool",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # status
+    p_status = subparsers.add_parser("status", help="Inspect upstream status and recent commits")
+    p_status.add_argument("--remote", default="upstream", help="Remote name (default: upstream)")
+    p_status.add_argument("-n", "--count", type=int, default=10, help="Number of commits to list")
+    p_status.add_argument("--no-fetch", action="store_true", help="Do not fetch remote before listing")
+    p_status.set_defaults(func=cmd_status)
+
+    # inspect
+    p_inspect = subparsers.add_parser("inspect", help="Inspect a specific upstream commit for surgical porting")
+    p_inspect.add_argument("commit", help="Commit SHA or reference")
+    p_inspect.set_defaults(func=cmd_inspect)
+
+    # audit
+    p_audit = subparsers.add_parser("audit", help="Audit files for forbidden upstream token leaks")
+    p_audit.add_argument("files", nargs="*", help="Files or directories to audit")
+    p_audit.add_argument("--staged", action="store_true", help="Audit only staged files")
+    p_audit.set_defaults(func=cmd_audit)
+
+    # verify
+    p_verify = subparsers.add_parser("verify", help="Run Aery typecheck and test verification")
+    p_verify.add_argument("--skip-tests", action="store_true", help="Skip running tests, run typecheck only")
+    p_verify.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

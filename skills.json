@@ -1,6 +1,6 @@
 {
   "name": "aery-skills",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Official on-demand skill registry for Aery agent",
   "repository": "https://github.com/eminent337/aery-skills",
   "skills": [
@@ -8,7 +8,7 @@
       "name": "agent-eval",
       "version": "1.0.0",
       "description": "Use when evaluating AI agent tool-calling accuracy, calculating token cost across models, or detecting accuracy regressions across prompt versions.",
-      "category": "AI Agent Evaluation",
+      "category": "Evaluation & Quality",
       "author": "eminent337",
       "path": "skills/agent-eval",
       "entry": "SKILL.md",
@@ -29,22 +29,6 @@
       ]
     },
     {
-      "name": "brainstorming",
-      "version": "1.0.0",
-      "description": "\"You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation.\"",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/brainstorming",
-      "entry": "SKILL.md",
-      "scripts": [
-        "scripts/helper.js",
-        "scripts/server.cjs",
-        "scripts/start-server.sh",
-        "scripts/stop-server.sh",
-        "scripts/frame-template.html"
-      ]
-    },
-    {
       "name": "cybersec",
       "version": "1.0.0",
       "description": "Use when inspecting codebases for vulnerabilities, auditing host posture, triaging web/auth logs, auditing supply chain dependencies, or applying defensive security hardening patch recipes.",
@@ -57,37 +41,10 @@
       ]
     },
     {
-      "name": "dispatching-parallel-agents",
-      "version": "1.0.0",
-      "description": "Use when facing 2+ independent tasks that can be worked on without shared state or sequential dependencies",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/dispatching-parallel-agents",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "executing-plans",
-      "version": "1.0.0",
-      "description": "Use when you have a written implementation plan to execute in a separate session with review checkpoints",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/executing-plans",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "finishing-a-development-branch",
-      "version": "1.0.0",
-      "description": "Use when implementation is complete, all tests pass, and you need to decide how to integrate the work - guides completion of development work by presenting structured options for merge, PR, or cleanup",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/finishing-a-development-branch",
-      "entry": "SKILL.md"
-    },
-    {
       "name": "leanai",
       "version": "1.0.0",
       "description": "Use when inspecting application architectures, decoding binary formats and protocols, analyzing Electron/Go/native runtimes, or extracting type schemas and API contracts for interoperability.",
-      "category": "Architecture & Reverse Engineering",
+      "category": "Reverse Engineering",
       "author": "eminent337",
       "path": "skills/leanai",
       "entry": "SKILL.md",
@@ -99,7 +56,7 @@
       "name": "linux-ops",
       "version": "1.0.0",
       "description": "Use when generating systemd background services, setting up process watchdogs, validating cron schedules, or inspecting Linux service health.",
-      "category": "System & Infrastructure",
+      "category": "Systems & DevOps",
       "author": "eminent337",
       "path": "skills/linux-ops",
       "entry": "SKILL.md",
@@ -109,12 +66,15 @@
     },
     {
       "name": "managing-upstream-syncs",
-      "version": "1.0.0",
-      "description": "Use when you need to sync, fetch, update, or pull code from the upstream Pi repository.",
-      "category": "Git & Repository",
+      "version": "2.0.0",
+      "description": "Use when you need to sync, fetch, update, inspect, or surgically port code from upstream repositories (Kimchi, Oh-My-Pi, Jcode) into Aery.",
+      "category": "Upstream Synchronization",
       "author": "eminent337",
       "path": "skills/managing-upstream-syncs",
-      "entry": "SKILL.md"
+      "entry": "SKILL.md",
+      "scripts": [
+        "scripts/upstream-sync"
+      ]
     },
     {
       "name": "perf-opt",
@@ -127,96 +87,6 @@
       "scripts": [
         "scripts/perf-opt"
       ]
-    },
-    {
-      "name": "receiving-code-review",
-      "version": "1.0.0",
-      "description": "Use when receiving code review feedback, before implementing suggestions, especially if feedback seems unclear or technically questionable - requires technical rigor and verification, not performative agreement or blind implementation",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/receiving-code-review",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "requesting-code-review",
-      "version": "1.0.0",
-      "description": "Use when completing tasks, implementing major features, or before merging to verify work meets requirements",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/requesting-code-review",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "subagent-driven-development",
-      "version": "1.0.0",
-      "description": "Use when executing implementation plans with independent tasks in the current session",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/subagent-driven-development",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "systematic-debugging",
-      "version": "1.0.0",
-      "description": "Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/systematic-debugging",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "test-driven-development",
-      "version": "1.0.0",
-      "description": "Use when implementing any feature or bugfix, before writing implementation code",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/test-driven-development",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "using-git-worktrees",
-      "version": "1.0.0",
-      "description": "Use when starting feature work that needs isolation from current workspace or before executing implementation plans - ensures an isolated workspace exists via native tools or git worktree fallback",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/using-git-worktrees",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "using-superpowers",
-      "version": "1.0.0",
-      "description": "Use when starting any conversation - establishes how to find and use skills, requiring Skill tool invocation before ANY response including clarifying questions",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/using-superpowers",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "verification-before-completion",
-      "version": "1.0.0",
-      "description": "Use when about to claim work is complete, fixed, or passing, before committing or creating PRs - requires running verification commands and confirming output before making any success claims; evidence before assertions always",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/verification-before-completion",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "writing-plans",
-      "version": "1.0.0",
-      "description": "Use when you have a spec or requirements for a multi-step task, before touching code",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/writing-plans",
-      "entry": "SKILL.md"
-    },
-    {
-      "name": "writing-skills",
-      "version": "1.0.0",
-      "description": "Use when creating new skills, editing existing skills, or verifying skills work before deployment",
-      "category": "Agent Development Workflow",
-      "author": "eminent337",
-      "path": "skills/writing-skills",
-      "entry": "SKILL.md"
     }
   ]
 }
