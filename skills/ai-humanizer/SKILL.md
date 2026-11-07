@@ -42,7 +42,7 @@ Reverse engineering Scribbr and QuillBot via `leanai` revealed that AI detectors
 | **Burstiness ($CV = \sigma / \mu$)** | Low variance ($CV < 0.25$), uniform 18-22 word sentences. | High variance ($CV \ge 0.55$), short punchy lines mixed with complex clauses. | $CV \ge 0.55$ |
 | **Vocabulary Entropy** | High token predictability, repetitive low-entropy choices. | Unpredictable word choices, domain idioms, high lexical entropy. | Entropy $\ge 5.5$ |
 | **Cliché Signatures** | Transition adverbs (*"Furthermore"*, *"Moreover"*, *"In conclusion"*), adjectives (*"testament"*, *"delve"*, *"tapestry"*). | Direct claims, conversational connectors (*"Notice that"*, *"Ultimately"*), concrete nouns. | **0 Clichés** |
-| **Voice & Syntax** | S-V-O monotony, heavy passive voice, balanced lists of three. | Clause inversions, em-dashes, fragments, active assertions. | Passive $\le 5\%$ |
+| **Voice & Syntax** | S-V-O monotony, heavy passive voice, overused em/short-dashes, balanced lists of three. | Clause inversions, zero AI dashes, natural commas, fragments, active assertions. | Passive $\le 5\%$, 0 AI Dashes |
 
 > [!WARNING]
 > **The Free Paraphraser Trap:**
@@ -50,7 +50,7 @@ Reverse engineering Scribbr and QuillBot via `leanai` revealed that AI detectors
 
 ---
 
-## 3. The 4 Linguistic Laws for 0% AI Detection
+## 3. The 5 Linguistic Laws for 0% AI Detection
 
 When writing or revising content to pass detectors with 0% AI probability:
 
@@ -58,11 +58,17 @@ When writing or revising content to pass detectors with 0% AI probability:
 Never write consecutive sentences of similar length. Alternate violently:
 * Sentence 1 (10 words)
 * Sentence 2 (2 words) $\to$ *"That matters."*
-* Sentence 3 (24 words with an em-dash `—`)
+* Sentence 3 (22 words with natural commas or semicolons)
 * Sentence 4 (1 word) $\to$ *"Why?"*
 * Sentence 5 (1 word) $\to$ *"Simple."*
 
-### 2. Cliché Eradication
+### 2. Zero AI Dashes Law (Eradicate Em-Dashes & Short Dashes)
+LLMs heavily overuse em-dashes (`—`), en-dashes (`–`), double hyphens (`--`), and spaced short dashes (` - `) to separate parenthetical clauses. Modern detectors and discerning readers recognize this as a dead giveaway:
+* ❌ *The solution — which was simple — worked.* $\to$ ✔️ *The solution, which was simple, worked.*
+* ❌ *Fast - and reliable.* $\to$ ✔️ *Fast, and reliable.*
+* Split over-long sentences into crisp independent sentences instead of joining with dashes.
+
+### 3. Cliché Eradication
 Strip formulaic transition words:
 * ❌ *Furthermore / Moreover / Additionally* $\to$ Start directly with the actor or conversational adverbial (*"Today,"*, *"Notice that"*).
 * ❌ *In conclusion / In summary* $\to$ *"Ultimately,"* or state the conclusion directly.
@@ -71,11 +77,11 @@ Strip formulaic transition words:
 * ❌ *A testament to* $\to$ *"Proof of"*, *"shows that"*.
 * ❌ *Tapestry / Rich tapestry* $\to$ *"Mix"*, *"mosaic"*.
 
-### 3. Cadence & Contraction Naturalization
+### 4. Cadence & Contraction Naturalization
 * Use natural contractions: *"it's"*, *"don't"*, *"can't"*, *"won't"*, *"there's"*.
 * Inject rhetorical breaks: *"In reality? It's messy."*, *"Sounds great on paper."*
 
-### 4. Concrete Physical Grounding
+### 5. Concrete Physical Grounding
 Replace abstract academic generalities with concrete specifics and active verbs.
 
 ---
