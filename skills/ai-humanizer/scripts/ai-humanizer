@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-ai-humanizer v2.0.0: Professional AI Detection & Humanization Engine.
-Engineered following leanai principles: zero-dependency, reverse-engineered Scribbr/QuillBot
-neural paraphraser integration, rhythm disruption (burstiness), AI dash eradication,
-and closed-loop verification.
+ai-humanizer v2.1.0: Professional AI Detection & Humanization Engine.
+Reverse-engineered using leanai:
+1. Bi-directional context neural paraphrasing via Scribbr / QuillBot API (paraphraser-standard-en-5.1.3, paras_14)
+2. QuillBot fingerprint and cliché eradication
+3. Complete AI dash stripping (em, en, short dashes)
+4. Multi-stage paragraph-level burstiness modulation (CV >= 0.55)
+5. Closed-loop verification
 """
 
 import sys
@@ -16,7 +19,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ANSI Colors
 BOLD = "\033[1m"
@@ -28,7 +31,7 @@ MAGENTA = "\033[35m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
-# 70+ High-Frequency AI Transitions, Overused Adjectives & Corporate Hedging Phrases
+# 70+ High-Frequency AI Transitions, Overused Adjectives & QuillBot Artifacts
 AI_CLICHES = [
     r"\bfurthermore\b",
     r"\bmoreover\b",
@@ -38,11 +41,14 @@ AI_CLICHES = [
     r"\bto sum up\b",
     r"\bin sum\b",
     r"\ball in all\b",
+    r"\bsumming up\b",
+    r"\bin a nutshell\b",
     r"\bit is crucial to\b",
     r"\bit is essential to\b",
     r"\bit is important to (note|remember|recognize|highlight)\b",
     r"\bit is worth noting that\b",
     r"\bplays a (crucial|pivotal|vital|key|fundamental) role\b",
+    r"\bplays an? (essential|important|vital|key|crucial) part\b",
     r"\ba testament to\b",
     r"\bdelve(s|d)? into\b",
     r"\btapestry of\b",
@@ -101,6 +107,7 @@ AI_CLICHES = [
     r"\blasting impression\b",
     r"\bpreviously unheard-of\b",
     r"\bare also essential for\b",
+    r"\bin order to\b",
 ]
 
 # Passive voice patterns
@@ -199,19 +206,14 @@ def count_passive(text: str) -> int:
 
 
 def count_ai_dashes(text: str) -> int:
-    """
-    Counts em-dashes (—), en-dashes (–), double-hyphens (--),
-    and spaced short dashes ( - ) commonly overused by AI models.
-    """
+    """Counts em-dashes (—), en-dashes (–), double-hyphens (--), and spaced short dashes ( - )."""
     return len(re.findall(r"(?:[—–]|--+|(?<=\S)[^\S\r\n]+-[^\S\r\n]+(?=\S))", text))
 
 
 def strip_ai_dashes(text: str) -> str:
     """
     Purges AI em-dashes, en-dashes, double-hyphens, and spaced short dashes.
-    Converts them into natural commas, semicolons, or clean pauses.
-    Preserves intra-word hyphens (e.g., 'state-of-the-art', 'zero-dependency')
-    and markdown bullet points ('- item').
+    Preserves intra-word hyphens (e.g. 'state-of-the-art') and list bullets.
     """
     # 1. Unspaced em/en dashes between words: word—word or word–word -> word, word
     text = re.sub(r"(\b\w+)\s*[—–]\s*(\w+\b)", r"\1, \2", text)
@@ -234,11 +236,13 @@ def strip_ai_dashes(text: str) -> str:
     return text
 
 
-def scribbr_paraphrase_single(sentence: str) -> str:
+def scribbr_paraphrase_contextual(item: Tuple[str, str, str]) -> str:
     """
-    Calls the reverse-engineered Scribbr / QuillBot live neural paraphrasing API.
+    Calls the reverse-engineered Scribbr / QuillBot live neural paraphrasing API
+    with BI-DIRECTIONAL CONTEXT (leftContext, rightContext, preferActive: true).
     Model: paraphraser-standard-en-5.1.3 (paras_14).
     """
+    sentence, left_ctx, right_ctx = item
     sentence = sentence.strip()
     if len(sentence) < 8:
         return sentence
@@ -252,8 +256,8 @@ def scribbr_paraphrase_single(sentence: str) -> str:
     }
     payload = json.dumps({
         "sent": sentence,
-        "leftContext": "",
-        "rightContext": "",
+        "leftContext": left_ctx or "",
+        "rightContext": right_ctx or "",
         "nBeams": 1,
         "frozenWords": [],
         "preferActive": True,
@@ -262,7 +266,7 @@ def scribbr_paraphrase_single(sentence: str) -> str:
 
     req = urllib.request.Request(url, data=payload, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if "data" in data and "paras_14" in data["data"] and len(data["data"]["paras_14"]) > 0:
                 alt = data["data"]["paras_14"][0]["alt"]
@@ -274,14 +278,23 @@ def scribbr_paraphrase_single(sentence: str) -> str:
 
 
 def scribbr_neural_paraphrase(text: str) -> str:
-    """Paraphrases sentences concurrently using Scribbr's live neural API."""
+    """
+    Paraphrases sentences concurrently with bi-directional context awareness
+    matching humanizer-widget.js:98-100.
+    """
     sentences = split_sentences(text)
     if not sentences:
         return text
 
-    # Concurrently rewrite up to 5 sentences at once
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(scribbr_paraphrase_single, sentences))
+    items = []
+    n = len(sentences)
+    for i in range(n):
+        left_ctx = sentences[i - 1] if i > 0 else ""
+        right_ctx = sentences[i + 1] if i < n - 1 else ""
+        items.append((sentences[i], left_ctx, right_ctx))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(scribbr_paraphrase_contextual, items))
 
     return " ".join(results)
 
@@ -315,7 +328,7 @@ def score_text(text: str) -> Dict[str, Any]:
     else:
         burstiness_penalty = 0.0
 
-    # 2. Cliché Penalty: 10 points per unique cliché (max 45)
+    # 2. Cliché Penalty
     cliche_penalty = min(45.0, len(cliches) * 10.0)
 
     # 3. Monotonous Mean Sentence Length Penalty (AI defaults to 17-23 words)
@@ -328,12 +341,11 @@ def score_text(text: str) -> Dict[str, Any]:
     passive_ratio = passive_cnt / max(1, len(sentences))
     passive_penalty = 10.0 if passive_ratio > 0.4 else 0.0
 
-    # 5. AI Dashes Penalty: em-dashes and spaced hyphens are heavy AI indicators
+    # 5. AI Dashes Penalty
     dash_penalty = min(15.0, dash_cnt * 5.0)
 
     total_score = min(99.0, max(0.0, burstiness_penalty + cliche_penalty + length_penalty + passive_penalty + dash_penalty))
 
-    # Sentence Chunks Classification
     chunks = []
     for s, l in zip(sentences, sent_lengths):
         s_cliches = detect_cliches(s)
@@ -376,14 +388,14 @@ def score_text(text: str) -> Dict[str, Any]:
 def humanize_deep(text: str, use_neural: bool = True) -> str:
     """
     Multi-stage syntactic and rhythm disruption engine:
-    1. Neural Paraphrase: Runs sentences through Scribbr's live neural API (paraphraser-standard-en-5.1.3).
+    1. Neural Paraphrase: Runs sentences through Scribbr's live neural API with left/right context.
     2. Purges AI em-dashes, en-dashes, double-hyphens, and short dashes.
-    3. Strips formulaic transitions, academic fluff, and AI cliché constructs.
+    3. Strips formulaic transitions, academic fluff, and QuillBot tell artifacts.
     4. Naturalizes contractions and active conversational verbs.
-    5. Modulates sentence rhythms without any dashes (splits long sentences, inserts punchy anchors).
+    5. Modulates sentence rhythms without any dashes (breaks uniform clusters).
     6. Closed-loop verification loop to guarantee score < 10%.
     """
-    # Stage 0: Neural Paraphrase via Scribbr Live API
+    # Stage 0: Neural Paraphrase via Scribbr Live API with Bi-directional Context
     if use_neural:
         try:
             text = scribbr_neural_paraphrase(text)
@@ -400,10 +412,11 @@ def humanize_deep(text: str, use_neural: bool = True) -> str:
     replacements = [
         (r"^(In today's fast-paced digital world|In today's modern world|In the digital age),\s*", "Today, "),
         (r"^(Furthermore|Moreover|Additionally|In addition),\s*", ""),
-        (r"^(In conclusion|In summary|To summarize|To sum up|In sum|All in all),\s*", "Ultimately, "),
-        (r"^It is (crucial|essential|important) to (note|remember|recognize) that\s*", "Notice that "),
+        (r"^(In conclusion|In summary|To summarize|To sum up|In sum|All in all|Summing up|In a nutshell),\s*", "Ultimately, "),
+        (r"^It is (crucial|essential|important) to (note|remember|recognize|bear in mind) that\s*", "Notice that "),
         (r"^It is worth noting that\s*", "Keep in mind, "),
         (r"\bplays a (crucial|pivotal|vital|key|fundamental) role in\b", "drives"),
+        (r"\bplays an? (essential|important|vital|key|crucial) part in\b", "drives"),
         (r"\ba testament to\b", "proof of"),
         (r"\bdelve(s|d)? into\b", "examine"),
         (r"\b(rich )?tapestry of\b", "mix of"),
@@ -439,7 +452,7 @@ def humanize_deep(text: str, use_neural: bool = True) -> str:
             s = re.sub(pat, rep, s, flags=re.IGNORECASE)
         contracted.append(s)
 
-    # Stage 4: Burstiness & Rhythm modulation (ZERO DASHES)
+    # Stage 4: Burstiness & Rhythm modulation (ZERO DASHES, BREAK UNIFORM CLUSTERS)
     result_sents = []
     short_anchors = [
         "That matters.",
@@ -550,7 +563,7 @@ When writing essays, articles, or prose, you MUST strictly adhere to these 5 lin
    - Target CV (std_dev / mean) >= 0.60.
 
 2. CLICHÉ ERADICATION:
-   - FORBIDDEN TRANSITIONS: "Furthermore", "Moreover", "In conclusion", "Additionally", "It is important to note", "To sum up".
+   - FORBIDDEN TRANSITIONS: "Furthermore", "Moreover", "In conclusion", "Additionally", "It is important to note", "To sum up", "In sum".
    - FORBIDDEN ADJECTIVES/NOUNS: "testament to", "delve into", "tapestry", "beacon", "pivotal role", "ever-evolving", "holistic".
    - Start sentences directly with the actor, action, or conversational adverbial ("Today,", "Notice that").
 

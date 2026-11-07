@@ -18,8 +18,8 @@
     },
     {
       "name": "ai-humanizer",
-      "version": "2.0.0",
-      "description": "Professional AI detector evasion & humanization engine with reverse-engineered Scribbr/QuillBot live neural paraphraser integration, burstiness rhythm modulation, and AI dash eradication.",
+      "version": "2.1.0",
+      "description": "Professional AI detector evasion & humanization engine with reverse-engineered Scribbr/QuillBot bi-directional neural paraphraser, QuillBot artifact purging, burstiness rhythm modulation, and AI dash eradication.",
       "category": "Writing & Forensics",
       "author": "eminent337",
       "path": "skills/ai-humanizer",

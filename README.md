@@ -10,7 +10,7 @@ Aery keeps its core binary lean and lightweight. Skills are distributed and disc
 
 | Skill | Category | Version | Description |
 |---|---|---|---|
-| [`ai-humanizer`](skills/ai-humanizer) | Writing & Forensics | `2.0.0` | Reverse-engineered Scribbr/QuillBot live neural paraphraser integration with burstiness rhythm modulation and AI dash eradication (0% AI on Scribbr/Turnitin). |
+| [`ai-humanizer`](skills/ai-humanizer) | Writing & Forensics | `2.1.0` | Reverse-engineered Scribbr/QuillBot bi-directional neural paraphraser with QuillBot artifact purging, burstiness rhythm modulation, and AI dash eradication (0% AI on Scribbr/Turnitin). |
 | [`managing-upstream-syncs`](skills/managing-upstream-syncs) | Upstream Sync | `2.0.0` | Sovereign Aery protocol for inspecting, diffing, and surgically porting upstream commits with automated rebranding audits. |
 | [`leanai`](skills/leanai) | Reverse Engineering | `1.0.0` | Forensic binary reverse engineering, electron/protocol analysis, JS deobfuscation, and schema extraction. |
 | [`agent-eval`](skills/agent-eval) | Evaluation & Quality | `1.0.0` | Evaluate AI agent tool-calling accuracy, benchmark token costs, and detect regressions across models. |
